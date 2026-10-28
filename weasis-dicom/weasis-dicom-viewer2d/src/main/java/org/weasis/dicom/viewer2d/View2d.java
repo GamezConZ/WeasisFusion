@@ -129,6 +129,7 @@ import org.weasis.dicom.explorer.pr.PrGraphicUtil;
 import org.weasis.dicom.viewer2d.KOComponentFactory.KOViewButton;
 import org.weasis.dicom.viewer2d.KOComponentFactory.KOViewButton.eState;
 import org.weasis.dicom.viewer2d.fusion.FusionController;
+import org.weasis.dicom.viewer2d.fusion.FusionDisplay;
 import org.weasis.dicom.viewer2d.fusion.FusionOp;
 import org.weasis.dicom.viewer2d.fusion.FusionScaleDragHandler;
 import org.weasis.dicom.viewer2d.mpr.MprView.Plane;
@@ -945,8 +946,9 @@ public class View2d extends DefaultView2d<DicomImageElement> {
   protected boolean isFusionLoading() {
     OpManager disOp = getDisplayOpManager();
     if (!disOp
-        .getParamValue(FusionOp.OP_NAME, FusionOp.P_FUSION_ENABLED, Boolean.class)
-        .orElse(Boolean.FALSE)) {
+            .getParamValue(FusionOp.OP_NAME, FusionOp.P_FUSION_ENABLED, Boolean.class)
+            .orElse(Boolean.FALSE)
+        || FusionController.displayOf(this) == FusionDisplay.BASE) {
       return false;
     }
     return FusionController.isVolumeBuilding(

@@ -172,6 +172,34 @@ class FusionWindowTest {
                 9000.0, new FusionWindow(0, 9000, 1, "BQML").displayTopLimit(Double.NaN), DELTA));
   }
 
+  @Test
+  @DisplayName("The bottom moves alone, both ends together, or as a window/level pair")
+  void bottomAndRangeMoveInTheDisplayUnit() {
+    FusionWindow window = suvWindow(0.0, 40000.0);
+    FusionWindow raised = window.withDisplayMin(2.0);
+    FusionWindow range = window.withDisplayRange(1.0, 7.0);
+    assertAll(
+        // 2 SUVbw is 8000 BQML; the top stays at 10 SUVbw.
+        () -> assertEquals(8_000.0, raised.min(), DELTA),
+        () -> assertEquals(40_000.0, raised.max(), DELTA),
+        () -> assertEquals("SUVbw", raised.displayUnit()),
+        () -> assertEquals(4_000.0, range.min(), DELTA),
+        () -> assertEquals(28_000.0, range.max(), DELTA),
+        () -> assertEquals(6.0, range.displayWidth(), DELTA),
+        () -> assertEquals(4.0, range.displayCenter(), DELTA));
+  }
+
+  @Test
+  @DisplayName("The bottom limit is zero activity, or the bottom when it already starts below")
+  void bottomLimitIsZeroUnlessBelow() {
+    assertAll(
+        () -> assertEquals(0.0, suvWindow(8000.0, 40000.0).displayBottomLimit(), DELTA),
+        () -> assertEquals(0.0, suvWindow(0.0, 40000.0).displayBottomLimit(), DELTA),
+        () -> assertEquals(-1.0, suvWindow(-4000.0, 40000.0).displayBottomLimit(), DELTA),
+        // Raw counts (SPECT without unit) read on their own scale.
+        () -> assertEquals(0.0, new FusionWindow(120, 900, 1, "CNTS").displayBottomLimit(), DELTA));
+  }
+
   private static ColorMap absoluteMap(String unit, double min, double max) {
     return ColorMap.builder("map")
         .domain(ColorMapDomain.absolute(unit, min, max))

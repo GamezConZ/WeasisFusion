@@ -14,8 +14,11 @@ import java.beans.PropertyChangeEvent;
 import java.beans.PropertyChangeListener;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import javax.swing.Action;
 import javax.swing.JComponent;
 import javax.swing.JMenu;
@@ -37,6 +40,9 @@ import org.weasis.core.api.gui.util.ActionW;
 import org.weasis.core.api.gui.util.AppProperties;
 import org.weasis.core.api.gui.util.GuiExecutor;
 import org.weasis.core.api.gui.util.GuiUtils;
+import org.weasis.core.api.image.OpManager;
+import org.weasis.core.api.image.PseudoColorOp;
+import org.weasis.core.api.image.WindowOp;
 import org.weasis.core.api.image.cv.CvUtil;
 import org.weasis.core.api.media.data.IdentityMask;
 import org.weasis.core.api.media.data.MediaSeries;
@@ -78,6 +84,7 @@ import org.weasis.dicom.viewer2d.ResetTools;
 import org.weasis.dicom.viewer2d.View2dContainer;
 import org.weasis.dicom.viewer2d.View2dFactory;
 import org.weasis.dicom.viewer2d.fusion.FusionController;
+import org.weasis.dicom.viewer2d.fusion.FusionDisplay;
 import org.weasis.dicom.viewer2d.fusion.FusionState;
 import org.weasis.dicom.viewer2d.mpr.MprView.Plane;
 import org.weasis.dicom.viewer2d.mpr.cmpr.CrossSectionParams;
@@ -146,7 +153,33 @@ public class MprContainer extends DicomViewerPlugin
           2,
           MprView.class.getName());
 
-  public static final List<MigLayoutModel> LAYOUT_LIST = List.of(view1, view2, view3, view4, view5);
+  /**
+   * The three planes on three rows for nuclear medicine reading (see {@link MprViewRole}): the base
+   * image alone, the functional overlay alone, then both fused. The views of a column show the same
+   * slice, with the same zoom and pan.
+   */
+  public static final MigLayoutModel VIEWS_3x3_FUSION =
+      new MigLayoutModel(
+          MprViewRole.FUSION_LAYOUT_ID,
+          Messages.getString("mpr.layout.fusion"),
+          3,
+          3,
+          MprView.class.getName());
+
+  /**
+   * The three planes on two rows (see {@link MprViewRole}): the base image alone, then fused with
+   * the functional overlay. Same column linking as {@link #VIEWS_3x3_FUSION}.
+   */
+  public static final MigLayoutModel VIEWS_2x3_FUSION =
+      new MigLayoutModel(
+          MprViewRole.FUSION_2X3_LAYOUT_ID,
+          Messages.getString("mpr.layout.fusion2x3"),
+          2,
+          3,
+          MprView.class.getName());
+
+  public static final List<MigLayoutModel> LAYOUT_LIST =
+      List.of(view1, view2, view3, view4, view5, VIEWS_3x3_FUSION, VIEWS_2x3_FUSION);
 
   /**
    * Layout used to display the three MPR views together with a curved-MPR panoramic view. The
@@ -272,10 +305,161 @@ public class MprContainer extends DicomViewerPlugin
 
   @Override
   protected synchronized void setLayoutModel(MigLayoutModel layoutModel) {
+    boolean fusionLayout =
+        isFusionLayout(layoutModel) || isFusionLayout(cellManager.getLayoutModel());
+    FusionState fusion = fusionLayout ? currentFusion() : null;
+    if (fusionLayout) {
+      releaseSecondaryViews();
+    }
     super.setLayoutModel(layoutModel);
+    assignViewRoles();
+    if (getMprController().getVolume() != null) {
+      linkViews();
+      applyFusion(fusion);
+    }
+    if (isFusionLayout(layoutModel)) {
+      // Every view starts on the same best fit, computed again once the cells have their size: the
+      // views kept from the previous layout would otherwise keep a zoom fitted to their old cell.
+      mprViews().forEach(v -> v.zoom(0.0));
+    }
     if (eventManager instanceof EventManager manager) {
       // Force to refresh view with ZoomType.CURRENT
       manager.reset(ResetTools.ZOOM);
+    }
+  }
+
+  private static boolean isFusionLayout(MigLayoutModel layout) {
+    return layout != null && MprViewRole.isFusionLayout(layout.getId());
+  }
+
+  /** The MPR views of the layout, in cell order. */
+  private List<MprView> mprViews() {
+    List<MprView> views = new ArrayList<>();
+    for (ViewCanvas<DicomImageElement> v : cellManager.getAllViewCanvases()) {
+      if (v instanceof MprView mprView) {
+        views.add(mprView);
+      }
+    }
+    return views;
+  }
+
+  /** Gives every MPR view of the layout its plane and what it shows of the fusion. */
+  public void assignViewRoles() {
+    String layoutId = cellManager.getLayoutModel().getId();
+    List<MprView> views = mprViews();
+    for (int rank = 0; rank < views.size(); rank++) {
+      views.get(rank).setRole(MprViewRole.of(layoutId, rank));
+    }
+  }
+
+  /**
+   * Links each plane to the other views showing it (the rows of the fusion layout). They display
+   * the slice the primary view of the plane renders, so it is resliced once and pinned once per
+   * view in the image cache, and released with the view.
+   */
+  private void linkViews() {
+    MprController controller = getMprController();
+    Map<Plane, List<MprView>> columns = MprViewRole.columns(mprViews(), MprView::getPlane);
+    for (Plane plane : Plane.values()) {
+      MprAxis axis = controller.getMprAxis(plane);
+      List<MprView> views = columns.getOrDefault(plane, List.of());
+      MprView primary = axis.getMprView();
+      if (!views.contains(primary) && !views.isEmpty()) {
+        primary = views.getFirst();
+        axis.setMprView(primary);
+      }
+      MprView main = primary;
+      List<MprView> linked = views.stream().filter(v -> v != main).toList();
+      axis.setLinkedViews(linked);
+      if (main != null && main.getSeries() != null && axis.getImageElement() != null) {
+        linked.stream()
+            .filter(v -> v.getSeries() != main.getSeries())
+            .forEach(v -> showLinked(main, v));
+      }
+    }
+  }
+
+  /** Shows the slice of {@code primary} in {@code linked}, with the same window and LUT. */
+  private static void showLinked(MprView primary, MprView linked) {
+    linked.setSeries(primary.getSeries());
+    for (String action : defaultMpr.getSynchData().getActions().keySet()) {
+      linked.setActionsInView(action, primary.getActionValue(action));
+    }
+    OpManager from = primary.getDisplayOpManager();
+    OpManager to = linked.getDisplayOpManager();
+    copyParams(
+        from,
+        to,
+        WindowOp.OP_NAME,
+        ActionW.WINDOW.cmd(),
+        ActionW.LEVEL.cmd(),
+        ActionW.LEVEL_MIN.cmd(),
+        ActionW.LEVEL_MAX.cmd(),
+        ActionW.PRESET.cmd(),
+        ActionW.DEFAULT_PRESET.cmd(),
+        ActionW.LUT_SHAPE.cmd(),
+        ActionW.IMAGE_PIX_PADDING.cmd());
+    copyParams(from, to, PseudoColorOp.OP_NAME, PseudoColorOp.P_LUT, PseudoColorOp.P_LUT_INVERSE);
+    linked.getImageLayer().updateDisplayOperations();
+    // After the image, which sets the model area the zoom and the pan apply to.
+    linked.followViewport(primary);
+  }
+
+  private static void copyParams(OpManager from, OpManager to, String op, String... keys) {
+    for (String key : keys) {
+      from.getParamValue(op, key).ifPresent(value -> to.setParamValue(op, key, value));
+    }
+  }
+
+  /** The fusion of a view showing it fused (or the base alone), or {@code null} when off. */
+  private FusionState currentFusion() {
+    for (MprView view : mprViews()) {
+      FusionState state =
+          FusionController.displayOf(view) == FusionDisplay.OVERLAY
+              ? null
+              : FusionController.snapshot(view);
+      if (state != null) {
+        return state;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Gives the fusion shown before a layout switch to the views that have none (the new rows of the
+   * fusion layout); the overlay row starts with the LUT of the fused row.
+   */
+  private void applyFusion(FusionState fusion) {
+    if (fusion == null) {
+      return;
+    }
+    List<ViewCanvas<DicomImageElement>> views =
+        mprViews().stream()
+            .filter(v -> FusionController.snapshot(v) == null)
+            .<ViewCanvas<DicomImageElement>>map(v -> v)
+            .toList();
+    FusionController.applyState(views, fusion);
+  }
+
+  /**
+   * Clears the views other than the primary view of each plane before a switch to or from the
+   * fusion layout. They are then disposed of with their pinned slice, instead of being moved into a
+   * cell meant for another plane, row or kind of view (the curved MPR).
+   */
+  private void releaseSecondaryViews() {
+    MprController controller = getMprController();
+    Set<MprView> primaries = new HashSet<>();
+    for (Plane plane : Plane.values()) {
+      MprAxis axis = controller.getMprAxis(plane);
+      axis.setLinkedViews(List.of());
+      if (axis.getMprView() != null) {
+        primaries.add(axis.getMprView());
+      }
+    }
+    for (ViewCanvas<DicomImageElement> v : cellManager.getAllViewCanvases()) {
+      if (!primaries.contains(v) && v.getSeries() != null) {
+        v.setSeries(null);
+      }
     }
   }
 
@@ -520,19 +704,8 @@ public class MprContainer extends DicomViewerPlugin
     control.resetListeners();
     control.reset();
 
-    // TODO Should be init elsewhere
-    for (var cell : cellManager.getAllEntries()) {
-      if (cell.getViewCanvas().orElse(null) instanceof MprView mprView) {
-        Plane plane =
-            switch (cell.getPosition()) {
-              case 1 -> Plane.CORONAL;
-              case 2 -> Plane.SAGITTAL;
-              default -> Plane.AXIAL;
-            };
-        mprView.setType(plane);
-        control.addPropertyChangeListener(mprView);
-      }
-    }
+    assignViewRoles();
+    mprViews().forEach(control::addPropertyChangeListener);
 
     final MprView view = selectLayoutPositionForAddingSeries(sequence);
     if (view != null) {
@@ -553,6 +726,8 @@ public class MprContainer extends DicomViewerPlugin
                 // Following actions need to be executed in EDT thread
                 GuiExecutor.execute(
                     () -> {
+                      // Before the synchronization, which then covers every row.
+                      linkViews();
                       eventManager
                           .getAction(ActionW.SYNCH)
                           .ifPresent(c -> c.setSelectedItem(MprContainer.defaultMpr));

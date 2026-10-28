@@ -14,7 +14,6 @@ import java.util.ArrayList;
 import javax.swing.Icon;
 import org.weasis.core.api.explorer.DataExplorerView;
 import org.weasis.core.api.explorer.model.DataExplorerModel;
-import org.weasis.core.api.gui.layout.MigCell;
 import org.weasis.core.api.gui.layout.MigLayoutModel;
 import org.weasis.core.api.gui.util.GuiUtils;
 import org.weasis.core.api.media.data.MediaElement;
@@ -38,7 +37,6 @@ import org.weasis.dicom.viewer2d.EventManager;
 import org.weasis.dicom.viewer2d.Messages;
 import org.weasis.dicom.viewer2d.fusion.FusionController;
 import org.weasis.dicom.viewer2d.fusion.FusionState;
-import org.weasis.dicom.viewer2d.mpr.MprView.Plane;
 
 @org.osgi.service.component.annotations.Component(service = SeriesViewerFactory.class)
 public class MprFactory implements SeriesViewerFactory {
@@ -83,19 +81,7 @@ public class MprFactory implements SeriesViewerFactory {
     instance.setInheritedFusion(pendingFusion);
     pendingFusion = null;
     ImageViewerPlugin.registerInDataExplorerModel(model, instance);
-    int index = 0;
-    for (MigCell cell : layout.model().getCells()) {
-      if (instance.getView2ds().get(cell.position()) instanceof MprView mprView) {
-        Plane plane =
-            switch (index) {
-              case 1 -> Plane.CORONAL;
-              case 2 -> Plane.SAGITTAL;
-              default -> Plane.AXIAL;
-            };
-        mprView.setType(plane);
-        index++;
-      }
-    }
+    instance.assignViewRoles();
     return instance;
   }
 

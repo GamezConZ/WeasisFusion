@@ -31,6 +31,7 @@ import org.weasis.dicom.viewer2d.EventManager;
 import org.weasis.dicom.viewer2d.mpr.MprView;
 import org.weasis.dicom.viewer2d.mpr.Volume;
 import org.weasis.opencv.op.lut.ByteLut;
+import org.weasis.opencv.op.lut.LutShape;
 import org.weasis.opencv.op.lut.colormap.ColorMap;
 
 /**
@@ -62,8 +63,10 @@ public final class FusionController {
    * of a layout keep whatever they show — the same series left unfused for comparison as much as an
    * unrelated one, or the functional series itself.
    *
-   * <p>MPR is the exception: its panes are three planes of a single acquisition and only ever show
-   * that one volume, so they take the change together and stay in sync.
+   * <p>MPR is the exception: its panes are planes of a single acquisition and only ever show that
+   * one volume, so they take the change together and stay in sync. In the MPR fusion layout the
+   * overlay alone ignores the color LUT (see {@link FusionDisplay#OVERLAY}) but shares the window
+   * and the transfer function with the fused row.
    */
   private static List<ViewCanvas<DicomImageElement>> targetViews() {
     ViewCanvas<DicomImageElement> selected = EventManager.getInstance().getSelectedViewPane();
@@ -96,6 +99,10 @@ public final class FusionController {
                 instanceof ByteLut l
             ? l
             : null;
+    LutShape shape =
+        disOp
+            .getParamValue(FusionOp.OP_NAME, FusionOp.P_FUSION_LUT_SHAPE, LutShape.class)
+            .orElse(null);
     FusionWindow window =
         disOp
             .getParamValue(FusionOp.OP_NAME, FusionOp.P_FUSION_WINDOW, FusionWindow.class)
@@ -115,7 +122,7 @@ public final class FusionController {
             : null;
     @SuppressWarnings("unchecked")
     MediaSeries<DicomImageElement> overlaySeries = (MediaSeries<DicomImageElement>) series;
-    return new FusionState(overlaySeries, lut, window, base, overlay, volume);
+    return new FusionState(overlaySeries, lut, shape, window, base, overlay, volume);
   }
 
   /**
@@ -130,6 +137,7 @@ public final class FusionController {
       OpManager disOp = view.getDisplayOpManager();
       disOp.setParamValue(FusionOp.OP_NAME, FusionOp.P_FUSION_SERIES, state.series());
       disOp.setParamValue(FusionOp.OP_NAME, FusionOp.P_FUSION_LUT, state.lut());
+      disOp.setParamValue(FusionOp.OP_NAME, FusionOp.P_FUSION_LUT_SHAPE, state.lutShape());
       disOp.setParamValue(FusionOp.OP_NAME, FusionOp.P_FUSION_WINDOW, state.window());
       disOp.setParamValue(FusionOp.OP_NAME, FusionOp.P_OPACITY_BASE, state.baseOpacity());
       disOp.setParamValue(FusionOp.OP_NAME, FusionOp.P_OPACITY_OVERLAY, state.overlayOpacity());
@@ -141,7 +149,8 @@ public final class FusionController {
       view.getImageLayer().updateDisplayOperations();
     }
     EventManager.getInstance().refreshFusionWindowControl();
-    if (state.volume() == null) {
+    // A build already running applies its volume to every pane carrying the series.
+    if (state.volume() == null && !isVolumeBuilding(state.series())) {
       buildVolume(state.series());
     }
   }
@@ -200,12 +209,57 @@ public final class FusionController {
 
   /**
    * Moves the top of the display window to {@code displayMax} (in its display unit), the bottom
-   * unchanged. Leaves the window control alone: it is the caller.
+   * unchanged.
    */
   public static void applyWindowTop(double displayMax) {
     FusionWindow window = currentWindow();
     if (window != null && Double.isFinite(displayMax) && displayMax > window.displayMin()) {
-      setParam(FusionOp.P_FUSION_WINDOW, window.withDisplayMax(displayMax));
+      applyWindow(window.withDisplayMax(displayMax));
+    }
+  }
+
+  /**
+   * Moves the bottom of the display window to {@code displayMin} (in its display unit), the top
+   * unchanged: the background threshold below which the overlay is not shown.
+   */
+  public static void applyWindowBottom(double displayMin) {
+    FusionWindow window = currentWindow();
+    if (window != null && Double.isFinite(displayMin) && displayMin < window.displayMax()) {
+      applyWindow(window.withDisplayMin(displayMin));
+    }
+  }
+
+  /**
+   * Applies {@code window} to every pane sharing it — in MPR, every plane and every row of the
+   * fusion layout, the fused overlay and the overlay alone alike — and lets the scale sliders
+   * follow.
+   */
+  public static void applyWindow(FusionWindow window) {
+    if (window != null) {
+      applyParam(FusionOp.P_FUSION_WINDOW, window);
+    }
+  }
+
+  /** What {@code view} shows of the fused pair; {@link FusionDisplay#FUSED} by default. */
+  public static FusionDisplay displayOf(ViewCanvas<DicomImageElement> view) {
+    if (view == null) {
+      return FusionDisplay.FUSED;
+    }
+    return view.getDisplayOpManager()
+        .getParamValue(FusionOp.OP_NAME, FusionOp.P_FUSION_DISPLAY, FusionDisplay.class)
+        .orElse(FusionDisplay.FUSED);
+  }
+
+  /** Sets what {@code view} shows of the fused pair; the overlay caches bake it in. */
+  public static void setDisplay(ViewCanvas<DicomImageElement> view, FusionDisplay display) {
+    if (displayOf(view) == display) {
+      return;
+    }
+    OpManager disOp = view.getDisplayOpManager();
+    disOp.setParamValue(FusionOp.OP_NAME, FusionOp.P_FUSION_DISPLAY, display);
+    clearCache(disOp);
+    if (view.getImage() != null) {
+      view.getImageLayer().updateDisplayOperations();
     }
   }
 
@@ -257,6 +311,7 @@ public final class FusionController {
     boolean clearCache =
         seriesChange
             || FusionOp.P_FUSION_LUT.equals(propertyName)
+            || FusionOp.P_FUSION_LUT_SHAPE.equals(propertyName)
             || FusionOp.P_FUSION_WINDOW.equals(propertyName)
             || FusionOp.P_FUSION_VOLUME.equals(propertyName);
     for (ViewCanvas<DicomImageElement> view : targetViews()) {

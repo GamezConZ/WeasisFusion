@@ -11,12 +11,14 @@ package org.weasis.dicom.viewer2d.fusion;
 
 import java.awt.geom.AffineTransform;
 import java.awt.geom.Point2D;
+import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.WeakHashMap;
 import org.dcm4che3.data.Tag;
+import org.dcm4che3.img.util.LookupTableUtils;
 import org.joml.Vector3d;
 import org.opencv.core.Core;
 import org.opencv.core.CvType;
@@ -37,8 +39,10 @@ import org.weasis.dicom.codec.TagD;
 import org.weasis.dicom.codec.geometry.GeometryOfSlice;
 import org.weasis.dicom.viewer2d.mpr.Volume;
 import org.weasis.opencv.data.ImageCV;
+import org.weasis.opencv.data.LookupTableCV;
 import org.weasis.opencv.data.PlanarImage;
 import org.weasis.opencv.op.lut.ByteLut;
+import org.weasis.opencv.op.lut.LutShape;
 import org.weasis.opencv.op.lut.colormap.ColorMap;
 import org.weasis.opencv.op.lut.colormap.ColorMapCompiler;
 
@@ -68,9 +72,12 @@ import org.weasis.opencv.op.lut.colormap.ColorMapCompiler;
  *   <li>{@link #P_FUSION_VOLUME} - The resampled PET Volume, optional (Volume)
  *   <li>{@link #P_FUSION_LUT} - The PET color lookup table (ByteLut)
  *   <li>{@link #P_FUSION_WINDOW} - The PET display window (FusionWindow)
+ *   <li>{@link #P_FUSION_LUT_SHAPE} - The transfer function over the window (LutShape)
  *   <li>{@link #P_OPACITY_BASE} - CT opacity 0.0–1.0 (Double)
  *   <li>{@link #P_OPACITY_OVERLAY} - PET opacity 0.0–1.0 (Double)
  *   <li>{@link #P_BASE_IMAGE} - The current CT DicomImageElement (DicomImageElement)
+ *   <li>{@link #P_FUSION_DISPLAY} - What the view shows of the pair, fused by default
+ *       (FusionDisplay)
  * </ul>
  */
 public class FusionOp extends AbstractOp {
@@ -92,6 +99,9 @@ public class FusionOp extends AbstractOp {
   /** The PET display window ({@link FusionWindow}, in modality-LUT values). */
   public static final String P_FUSION_WINDOW = "fusion.window";
 
+  /** The transfer function from the window to the LUT entries ({@link LutShape}). */
+  public static final String P_FUSION_LUT_SHAPE = "fusion.lut.shape";
+
   /** CT/MR opacity (0.0 to 1.0). */
   public static final String P_OPACITY_BASE = "fusion.opacity.base";
 
@@ -100,6 +110,9 @@ public class FusionOp extends AbstractOp {
 
   /** The current base (CT/MR) image element. */
   public static final String P_BASE_IMAGE = "fusion.base.image";
+
+  /** What the view shows of the pair ({@link FusionDisplay}); set per view, never shared. */
+  public static final String P_FUSION_DISPLAY = "fusion.display";
 
   /** Default {@link #P_OPACITY_BASE}: the anatomy is shown untouched where the overlay is cold. */
   public static final double DEFAULT_BASE_OPACITY = 1.0;
@@ -110,6 +123,13 @@ public class FusionOp extends AbstractOp {
    * higher darkens the CT more than it reveals.
    */
   public static final double DEFAULT_OVERLAY_OPACITY = 0.5;
+
+  /**
+   * Default {@link #P_FUSION_LUT_SHAPE}: the inverse logarithm (exponential) holds the low counts
+   * of a SPECT, where scatter and background sit, in the cold end of the palette and spends it on
+   * the uptake.
+   */
+  public static final LutShape DEFAULT_LUT_SHAPE = LutShape.LOG_INV;
 
   private static final int LUT_SIZE = 256;
 
@@ -125,7 +145,13 @@ public class FusionOp extends AbstractOp {
   private static final int ALPHA_OPAQUE_FROM = LUT_SIZE / 10;
 
   /** Identity gray BGR LUT used when no color LUT is selected. */
-  private static final byte[][] GRAY_LUT = buildGrayLut();
+  private static final byte[][] GRAY_LUT = buildGrayLut(false);
+
+  /**
+   * Inverted gray of the overlay shown alone, as nuclear medicine reads it (like MONOCHROME1, PS3.3
+   * C.7.6.3.1.2): white at and below the bottom of the window, black at and above its top.
+   */
+  private static final byte[][] INVERTED_GRAY_LUT = buildGrayLut(true);
 
   private static final int VOLUME_OVERLAY_CACHE_SIZE = 8;
 
@@ -214,18 +240,30 @@ public class FusionOp extends AbstractOp {
     params.put(Param.OUTPUT_IMG, result);
   }
 
+  /** What this view shows of the pair; {@link FusionDisplay#FUSED} unless set otherwise. */
+  public FusionDisplay getDisplay() {
+    return getParam(P_FUSION_DISPLAY, FusionDisplay.class, FusionDisplay.FUSED);
+  }
+
   @SuppressWarnings("unchecked")
   private PlanarImage fusionProcess(PlanarImage baseSource) {
-    Boolean enabled = getParam(P_FUSION_ENABLED, Boolean.class);
-    if (enabled == null || !enabled) {
+    FusionDisplay display = getDisplay();
+    if (display == FusionDisplay.BASE) {
       return baseSource;
     }
-
+    boolean overlayOnly = display == FusionDisplay.OVERLAY;
+    Boolean enabled = getParam(P_FUSION_ENABLED, Boolean.class);
     MediaSeries<DicomImageElement> overlaySeries =
         (MediaSeries<DicomImageElement>) params.get(P_FUSION_SERIES);
     DicomImageElement baseImage = getParam(P_BASE_IMAGE, DicomImageElement.class);
-    if (overlaySeries == null || baseImage == null) {
-      return baseSource;
+    if (enabled == null || !enabled || overlaySeries == null || baseImage == null) {
+      // Showing the anatomy where the functional series is expected would be misread as uptake.
+      return overlayOnly ? blank(baseSource) : baseSource;
+    }
+
+    if (overlayOnly) {
+      PlanarImage overlayImg = getOverlay(baseImage, overlaySeries, baseSource);
+      return overlayImg == null ? blank(baseSource) : overlayAlone(baseSource, overlayImg);
     }
 
     double overlayOpacity = getParam(P_OPACITY_OVERLAY, Double.class, DEFAULT_OVERLAY_OPACITY);
@@ -321,7 +359,7 @@ public class FusionOp extends AbstractOp {
   }
 
   /** Maps the overlay's real values to 8-bit grayscale through the series-wide window. */
-  private static PlanarImage normalizeOverlayImage(PlanarImage overlayReal, FusionWindow window) {
+  static PlanarImage normalizeOverlayImage(PlanarImage overlayReal, FusionWindow window) {
     double slope = 255.0 / (window.max() - window.min());
     ImageCV result = new ImageCV();
     overlayReal.toMat().convertTo(result, CvType.CV_8U, slope, -slope * window.min());
@@ -329,11 +367,42 @@ public class FusionOp extends AbstractOp {
   }
 
   /**
-   * The ABGR LUT the overlay is colorized with: color from the selected {@link ByteLut}, alpha
-   * reaching full opacity by {@link #ALPHA_OPAQUE_FROM}. The global PET opacity is applied later at
-   * composite time, so it is not baked in.
+   * The ABGR LUT the windowed intensity is looked up in: the color LUT (see {@link #colorLut()})
+   * read through the transfer function of {@link #P_FUSION_LUT_SHAPE}. Composing them keeps a
+   * single lookup per pixel, and the color bar, which paints this LUT against a linear value axis,
+   * shows where the curve puts the colors.
    */
-  private ByteLutAlpha buildAlphaLut() {
+  ByteLutAlpha buildAlphaLut() {
+    return shaped(colorLut(), transferFunction());
+  }
+
+  /**
+   * The transfer function in force, the same for the fused overlay and the overlay alone: linear
+   * under a map anchored to physical values (an SUVbw preset, the isodose bands of a dose grid),
+   * whose colors stand for given values that a curve would move.
+   */
+  private LutShape transferFunction() {
+    ByteLut lut = getParam(P_FUSION_LUT, ByteLut.class);
+    ColorMap map = lut == null ? null : lut.source();
+    if (map != null && !map.domain().isRelative()) {
+      return LutShape.LINEAR;
+    }
+    return getParam(P_FUSION_LUT_SHAPE, LutShape.class, DEFAULT_LUT_SHAPE);
+  }
+
+  /**
+   * Color from the selected {@link ByteLut}, alpha reaching full opacity by {@link
+   * #ALPHA_OPAQUE_FROM}. The global PET opacity is applied later at composite time, so it is not
+   * baked in. Shown alone the overlay is opaque inverted gray whatever the LUT: the palette belongs
+   * to the fusion, and there is no anatomy to keep visible under its lowest entries.
+   */
+  private ByteLutAlpha colorLut() {
+    if (getDisplay() == FusionDisplay.OVERLAY) {
+      byte[] alpha = new byte[LUT_SIZE];
+      Arrays.fill(alpha, (byte) 0xFF);
+      byte[][] gray = INVERTED_GRAY_LUT;
+      return new ByteLutAlpha(OP_NAME, new byte[][] {alpha, gray[0], gray[1], gray[2]});
+    }
     ByteLut lut = getParam(P_FUSION_LUT, ByteLut.class);
     ColorMap map = lut == null ? null : lut.source();
     if (map != null && map.hasAlpha()) {
@@ -345,8 +414,51 @@ public class FusionOp extends AbstractOp {
         OP_NAME, bgr, 1.0f, ALPHA_TRANSPARENT_BELOW, ALPHA_OPAQUE_FROM);
   }
 
+  /**
+   * {@code lut} read through {@code shape}: entry {@code i} takes the entry the curve maps it to.
+   */
+  static ByteLutAlpha shaped(ByteLutAlpha lut, LutShape shape) {
+    int[] map = shapeMap(shape);
+    byte[][] src = lut.lutTable();
+    byte[][] dst = new byte[src.length][LUT_SIZE];
+    for (int c = 0; c < src.length; c++) {
+      for (int i = 0; i < LUT_SIZE; i++) {
+        dst[c][i] = src[c][map[i]];
+      }
+    }
+    return new ByteLutAlpha(lut.name(), dst);
+  }
+
+  /**
+   * The LUT entry each windowed intensity takes under {@code shape}, with the curves of the base
+   * image window ({@link LookupTableUtils#createVoiLut}) so a shape reads the same on both layers.
+   * The curve is stretched to its ends, so the bottom and the top of the window keep the first and
+   * the last entry of the palette. Identity for a linear or missing shape.
+   */
+  static int[] shapeMap(LutShape shape) {
+    int[] map = new int[LUT_SIZE];
+    LookupTableCV curve =
+        shape == null || LutShape.LINEAR.equals(shape)
+            ? null
+            : LookupTableUtils.createVoiLut(
+                shape, LUT_SIZE, LUT_SIZE / 2.0, 0, LUT_SIZE - 1, 8, false, false);
+    int last = LUT_SIZE - 1;
+    if (curve == null || curve.lookup(0, last) == curve.lookup(0, 0)) {
+      for (int i = 0; i < LUT_SIZE; i++) {
+        map[i] = i;
+      }
+      return map;
+    }
+    double low = curve.lookup(0, 0);
+    double span = curve.lookup(0, last) - low;
+    for (int i = 0; i < LUT_SIZE; i++) {
+      map[i] = (int) Math.clamp(Math.round((curve.lookup(0, i) - low) * last / span), 0, last);
+    }
+    return map;
+  }
+
   /** Colorizes a grayscale PET image into an ABGR overlay. */
-  private PlanarImage applyAlphaLut(PlanarImage overlayGray) {
+  PlanarImage applyAlphaLut(PlanarImage overlayGray) {
     ByteLutAlpha abgrLut = buildAlphaLut();
 
     Mat src = overlayGray.toMat();
@@ -418,6 +530,22 @@ public class FusionOp extends AbstractOp {
     return result;
   }
 
+  /** The colorized overlay painted alone, on a black image of the size of {@code baseSource}. */
+  static PlanarImage overlayAlone(PlanarImage baseSource, PlanarImage overlayImg) {
+    // Over black, so a transfer map keeps its own transparency; a plain LUT is opaque anyway.
+    ImageCV black = blank(baseSource);
+    try {
+      return compositeOver(black, overlayImg, 0.0, 1.0);
+    } finally {
+      black.release();
+    }
+  }
+
+  /** Black BGR image of the size of {@code baseSource}: the background of the overlay alone. */
+  private static ImageCV blank(PlanarImage baseSource) {
+    return new ImageCV(baseSource.height(), baseSource.width(), CvType.CV_8UC3, Scalar.all(0));
+  }
+
   /** Ensures an 8-bit, 3-channel BGR matrix for compositing. */
   private static Mat toBgr8U(Mat src) {
     Mat m = src;
@@ -445,10 +573,10 @@ public class FusionOp extends AbstractOp {
     }
   }
 
-  private static byte[][] buildGrayLut() {
+  private static byte[][] buildGrayLut(boolean inverted) {
     byte[][] lut = new byte[3][LUT_SIZE];
     for (int i = 0; i < LUT_SIZE; i++) {
-      byte v = (byte) i;
+      byte v = (byte) (inverted ? LUT_SIZE - 1 - i : i);
       lut[0][i] = v;
       lut[1][i] = v;
       lut[2][i] = v;
@@ -472,7 +600,7 @@ public class FusionOp extends AbstractOp {
   public Optional<MeasurableLayer> getStatsLayer(
       DicomImageElement baseImage, PlanarImage baseSource) {
     Boolean enabled = getParam(P_FUSION_ENABLED, Boolean.class);
-    if (enabled == null || !enabled) {
+    if (enabled == null || !enabled || getDisplay() == FusionDisplay.BASE) {
       return Optional.empty();
     }
     MediaSeries<DicomImageElement> overlaySeries =
@@ -570,13 +698,16 @@ public class FusionOp extends AbstractOp {
 
   /**
    * The window and ABGR LUT the overlay is currently colorized with, so the color bar can show the
-   * exact scale being painted. Empty when fusion is off or has no overlay series.
+   * exact scale being painted. Empty when fusion is off, has no overlay series or the view does not
+   * fuse: the base image alone has no overlay, and the overlay alone reads in gray, its window
+   * given by the view annotations.
    */
   @SuppressWarnings("unchecked")
   public Optional<FusionColorScale> getColorScale() {
     Boolean enabled = getParam(P_FUSION_ENABLED, Boolean.class);
     if (enabled == null
         || !enabled
+        || getDisplay() != FusionDisplay.FUSED
         || !(params.get(P_FUSION_SERIES) instanceof MediaSeries<?> overlaySeries)) {
       return Optional.empty();
     }

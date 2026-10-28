@@ -54,6 +54,7 @@ import org.opencv.core.Point3;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.weasis.core.api.explorer.model.DataExplorerModel;
+import org.weasis.core.api.gui.model.ViewModel;
 import org.weasis.core.api.gui.util.ActionW;
 import org.weasis.core.api.gui.util.AppProperties;
 import org.weasis.core.api.gui.util.ComboItemListener;
@@ -67,6 +68,7 @@ import org.weasis.core.api.image.WindowOp;
 import org.weasis.core.api.media.data.MediaSeriesGroup;
 import org.weasis.core.api.media.data.SeriesComparator;
 import org.weasis.core.api.media.data.TagW;
+import org.weasis.core.api.util.FontTools;
 import org.weasis.core.api.util.ResourceUtil;
 import org.weasis.core.api.util.ResourceUtil.OtherIcon;
 import org.weasis.core.ui.editor.image.ImageViewerEventManager;
@@ -82,6 +84,7 @@ import org.weasis.core.ui.model.graphic.imp.seg.SegContour;
 import org.weasis.core.ui.model.layer.GraphicLayer;
 import org.weasis.core.ui.model.layer.LayerItem;
 import org.weasis.core.ui.model.layer.LayerType;
+import org.weasis.core.ui.model.utils.bean.PanPoint;
 import org.weasis.core.ui.model.utils.exceptions.InvalidShapeException;
 import org.weasis.core.ui.pref.PreferenceDialog;
 import org.weasis.core.ui.util.MouseEventDouble;
@@ -102,6 +105,10 @@ import org.weasis.dicom.codec.seg.SegmentationVolume;
 import org.weasis.dicom.explorer.DicomModel;
 import org.weasis.dicom.viewer2d.Messages;
 import org.weasis.dicom.viewer2d.View2d;
+import org.weasis.dicom.viewer2d.fusion.FusionController;
+import org.weasis.dicom.viewer2d.fusion.FusionDisplay;
+import org.weasis.dicom.viewer2d.fusion.FusionOp;
+import org.weasis.dicom.viewer2d.fusion.FusionWindowLevelHandler;
 import org.weasis.dicom.viewer2d.mip.MipView;
 import org.weasis.dicom.viewer2d.mpr.MprController.ControlPoints;
 import org.weasis.dicom.viewer2d.mpr.cmpr.CrossSectionDialog;
@@ -165,6 +172,7 @@ public class MprView extends View2d implements SliceCanvas, ViewProgress {
   private Plane plane;
 
   protected final MprController mprController;
+  private final FusionWindowLevelHandler overlayWindowHandler = new FusionWindowLevelHandler(this);
 
   public MprView(
       ImageViewerEventManager<DicomImageElement> eventManager, MprController controller) {
@@ -201,6 +209,9 @@ public class MprView extends View2d implements SliceCanvas, ViewProgress {
     if (mprController != null) {
       mprController.initListeners(this);
     }
+    // After the crosshair handles, before the window/level action it replaces on the overlay alone.
+    addMouseListener(overlayWindowHandler);
+    addMouseMotionListener(overlayWindowHandler);
   }
 
   @Override
@@ -235,6 +246,33 @@ public class MprView extends View2d implements SliceCanvas, ViewProgress {
     if (mprController != null) {
       mprController.initListeners(this);
     }
+  }
+
+  /**
+   * Takes the zoom and the pan of {@code source}, another view of the same plane, with its zoom
+   * action so a resize computes the same zoom again: the rows of the fusion layouts frame a column
+   * the same way from the first paint on.
+   */
+  void followViewport(MprView source) {
+    for (String action : List.of(ActionW.ZOOM.cmd(), ViewCanvas.ZOOM_TYPE_CMD)) {
+      Object value = source.getActionValue(action);
+      if (value != null) {
+        actionsInView.put(action, value);
+      }
+    }
+    ViewModel model = source.getViewModel();
+    getViewModel()
+        .setModelOffset(model.getModelOffsetX(), model.getModelOffsetY(), model.getViewScale());
+    updateAffineTransform();
+  }
+
+  /**
+   * Gives this view its place in the layout. The mouse listeners do not depend on the plane, so
+   * they are left as installed (adding them again would run every crosshair gesture twice).
+   */
+  void setRole(MprViewRole role) {
+    this.plane = role.plane();
+    FusionController.setDisplay(this, role.display());
   }
 
   public Point3 getVolumePoint3FromMouse(int x, int y) {
@@ -564,7 +602,16 @@ public class MprView extends View2d implements SliceCanvas, ViewProgress {
 
   @Override
   public void propertyChange(PropertyChangeEvent evt) {
+    Point2D panStart = linkedPanStart(evt);
     super.propertyChange(evt);
+    if (panStart != null) {
+      ViewModel model = getViewModel();
+      double dx = model.getModelOffsetX() - panStart.getX();
+      double dy = model.getModelOffsetY() - panStart.getY();
+      if (dx != 0.0 || dy != 0.0) {
+        mprController.panOtherPlanes(this, dx, dy);
+      }
+    }
 
     final String command = evt.getPropertyName();
     if (command.equals(ActionW.SYNCH.cmd())) {
@@ -601,6 +648,22 @@ public class MprView extends View2d implements SliceCanvas, ViewProgress {
     // }
   }
 
+  /**
+   * The pan offset of this view before a pan the reader makes on it, when the fusion layout carries
+   * pans across the planes; {@code null} for any other event.
+   */
+  private Point2D linkedPanStart(PropertyChangeEvent evt) {
+    if (ActionW.SYNCH.cmd().equals(evt.getPropertyName())
+        && evt.getNewValue() instanceof SynchEvent synch
+        && synch.getView() == this
+        && synch.getEvents().get(ActionW.PAN.cmd()) instanceof PanPoint point
+        && (point.getState() == PanPoint.State.DRAGGING || point.getState() == PanPoint.State.MOVE)
+        && mprController.hasLinkedViews()) {
+      return new Point2D.Double(getViewModel().getModelOffsetX(), getViewModel().getModelOffsetY());
+    }
+    return null;
+  }
+
   @Override
   public void zoom(Double viewScale) {
     super.zoom(viewScale);
@@ -615,6 +678,9 @@ public class MprView extends View2d implements SliceCanvas, ViewProgress {
     }
 
     super.drawOnTop(g2d);
+    if (mprController.hasLinkedViews()) {
+      drawFusionRole(g2d);
+    }
 
     if (CurvedMprAxis.DEBUG_DRAW && plane == Plane.AXIAL) {
       MprContainer container =
@@ -626,6 +692,41 @@ public class MprView extends View2d implements SliceCanvas, ViewProgress {
           curvedAxis.drawDebug(g2d, this);
         }
       }
+    }
+  }
+
+  /**
+   * Names what this view of the fusion layout shows, by modality, and tells how to fill the overlay
+   * row while it has nothing to show.
+   */
+  private void drawFusionRole(Graphics2D g2d) {
+    FusionDisplay display = FusionController.displayOf(this);
+    OpManager disOp = getDisplayOpManager();
+    Object overlaySeries =
+        disOp
+                .getParamValue(FusionOp.OP_NAME, FusionOp.P_FUSION_ENABLED, Boolean.class)
+                .orElse(Boolean.FALSE)
+            ? disOp.getParamValue(FusionOp.OP_NAME, FusionOp.P_FUSION_SERIES).orElse(null)
+            : null;
+    String base = Objects.requireNonNullElse(FusionController.baseModality(this), "");
+    String overlay = Objects.requireNonNullElse(FusionController.modalityOf(overlaySeries), "");
+    String label =
+        switch (display) {
+          case BASE -> base;
+          case OVERLAY -> overlay;
+          case FUSED -> overlay.isEmpty() ? base : base + " + " + overlay;
+        };
+    g2d.setFont(getLayerFont());
+    FontMetrics fm = g2d.getFontMetrics();
+    if (!label.isEmpty()) {
+      // Below the orientation label of the top edge.
+      FontTools.paintFontOutline(
+          g2d, label, (getWidth() - fm.stringWidth(label)) / 2f, fm.getHeight() * 2.5f);
+    }
+    if (display == FusionDisplay.OVERLAY && overlaySeries == null) {
+      String msg = Messages.getString("mpr.fusion.no.overlay");
+      FontTools.paintColorFontOutline(
+          g2d, msg, (getWidth() - fm.stringWidth(msg)) / 2f, getHeight() / 2f, Color.ORANGE);
     }
   }
 
@@ -831,6 +932,10 @@ public class MprView extends View2d implements SliceCanvas, ViewProgress {
         return;
       }
       mprController.recenter(axis, getCenterMode());
+      if (mprController.hasLinkedViews()) {
+        // The crosshair lines moved in the views of the other rows as well.
+        mprController.repaintAllViews();
+      }
     }
   }
 
@@ -988,7 +1093,7 @@ public class MprView extends View2d implements SliceCanvas, ViewProgress {
                 mprAxis.updateImage();
               }
               if (mprAxisList != allAxis) {
-                allAxis.forEach(mprAxis -> mprAxis.getMprView().repaint());
+                mprController.repaintAllViews();
               }
             }
           });
@@ -1004,7 +1109,7 @@ public class MprView extends View2d implements SliceCanvas, ViewProgress {
                 mprAxis.updateImage();
               }
               if (mprAxisList != allAxis) {
-                allAxis.forEach(mprAxis -> mprAxis.getMprView().repaint());
+                mprController.repaintAllViews();
               }
             });
 
@@ -1056,7 +1161,7 @@ public class MprView extends View2d implements SliceCanvas, ViewProgress {
                 }
 
                 if (mprAxisList != allAxis) {
-                  allAxis.forEach(mprAxis -> mprAxis.getMprView().repaint());
+                  mprController.repaintAllViews();
                 }
               }
             });
@@ -1065,9 +1170,8 @@ public class MprView extends View2d implements SliceCanvas, ViewProgress {
 
   public boolean getAllViewsProperty(String key) {
     if (mprController != null) {
-      return getViewProperty(mprController.getAxial().getMprView(), key)
-          && getViewProperty(mprController.getCoronal().getMprView(), key)
-          && getViewProperty(mprController.getSagittal().getMprView(), key);
+      List<MprView> views = mprController.getAllViews();
+      return !views.isEmpty() && views.stream().allMatch(v -> getViewProperty(v, key));
     }
     return false;
   }
@@ -1085,9 +1189,7 @@ public class MprView extends View2d implements SliceCanvas, ViewProgress {
 
   public void showCrossLines(boolean selected, boolean all) {
     if (all) {
-      showCrossLines(mprController.getAxial().getMprView(), selected);
-      showCrossLines(mprController.getCoronal().getMprView(), selected);
-      showCrossLines(mprController.getSagittal().getMprView(), selected);
+      mprController.getAllViews().forEach(v -> showCrossLines(v, selected));
     } else {
       showCrossLines(this, selected);
     }
@@ -1106,9 +1208,7 @@ public class MprView extends View2d implements SliceCanvas, ViewProgress {
 
   public void showCrossCenter(boolean selected, boolean all) {
     if (all) {
-      showCrossCenter(mprController.getAxial().getMprView(), selected);
-      showCrossCenter(mprController.getCoronal().getMprView(), selected);
-      showCrossCenter(mprController.getSagittal().getMprView(), selected);
+      mprController.getAllViews().forEach(v -> showCrossCenter(v, selected));
     } else {
       showCrossCenter(this, selected);
     }

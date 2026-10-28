@@ -13,6 +13,7 @@ import org.weasis.core.api.media.data.MediaSeries;
 import org.weasis.dicom.codec.DicomImageElement;
 import org.weasis.dicom.viewer2d.mpr.Volume;
 import org.weasis.opencv.op.lut.ByteLut;
+import org.weasis.opencv.op.lut.LutShape;
 
 /**
  * Immutable snapshot of a view's active fusion configuration, used to seed a newly opened MPR with
@@ -21,6 +22,7 @@ import org.weasis.opencv.op.lut.ByteLut;
  *
  * @param series the overlay (e.g. PET/NM) series fused on top of the base image
  * @param lut the overlay color LUT
+ * @param lutShape the transfer function over the window, {@code null} for the default
  * @param window the overlay display window
  * @param baseOpacity the base (CT/MR) opacity in {@code [0, 1]}
  * @param overlayOpacity the overlay opacity in {@code [0, 1]}
@@ -30,6 +32,7 @@ import org.weasis.opencv.op.lut.ByteLut;
 public record FusionState(
     MediaSeries<DicomImageElement> series,
     ByteLut lut,
+    LutShape lutShape,
     FusionWindow window,
     double baseOpacity,
     double overlayOpacity,

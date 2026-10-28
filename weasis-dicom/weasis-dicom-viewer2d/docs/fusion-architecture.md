@@ -63,7 +63,10 @@ slice and on every path.
 | `FusionCompatibility` | Decides which same-study series can be fused onto the base series |
 | `FusionMeasurableLayer` | Exposes PET values under a ROI drawn on the base image (SUV statistics) |
 | `FusionColorScale` / `FusionColorBar` | The window + LUT actually painted, and the on-view color bar that displays them |
-| `FusionWindowListener` / `FusionScaleDragHandler` | Scale maximum slider, and the color-bar drag that drives it |
+| `FusionWindowListener` / `FusionScaleDragHandler` | Scale maximum and minimum sliders, and the color-bar drag (top, bottom, body) |
+| `FusionWindowGestures` | Pure arithmetic of the pointer gestures on the window, with the slider bounds |
+| `FusionWindowLevelHandler` | Window/level mouse action of a view showing the overlay alone |
+| `FusionDisplay` | What a view shows of the pair: fused, base alone, overlay alone (inverted gray) |
 | `ByteLutAlpha` (weasis-core) | 4-channel ABGR LUT: color from a `ByteLut`, per-entry alpha ramp |
 | `DicomMediaUtils.computeSUVFactor` (weasis-dicom-codec) | Computes `TagW.SuvFactor` per PET image |
 
@@ -79,7 +82,10 @@ slice and on every path.
   `(min, max, displayFactor, displayUnit)` holding **real values**. It is
   derived from the data (bottom 0, SUVbw when known, percent of the data
   maximum when the series has no unit) or declared by an anchored color map;
-  the user can then move its top only (see §6). A provisional window
+  the user can then move its top and its bottom (see §6). Raising the bottom
+  is the background threshold of SPECT reading, where raw counts carry no
+  unit to anchor the scale; it never goes below zero activity
+  (`FusionWindow.displayBottomLimit`). A provisional window
   (`fromSlice`) is computed on the EDT as soon as an overlay series is
   selected, then refined on the whole volume (`fromVolume`, using
   `FusionWindowEstimator`) so physiologic outliers saturate instead of
@@ -87,6 +93,15 @@ slice and on every path.
 - **Normalization.** Both paths map real values to 8-bit gray with the same
   linear ramp between `min` and `max`: below `min` is transparent
   background, above `max` saturates at the hottest LUT entry.
+- **Transfer function.** `FusionOp.P_FUSION_LUT_SHAPE` (a `LutShape`, inverse
+  logarithm by default, `FusionOp.DEFAULT_LUT_SHAPE`) bends that ramp with
+  the curves of the base image window (`LookupTableUtils.createVoiLut`),
+  stretched so the window ends keep the palette ends. It is composed into
+  the ABGR LUT rather than applied to the pixels, so the color bar shows
+  where the curve puts the colors. It never bends a map anchored to
+  physical values (SUVbw preset, isodose bands), whose colors stand for given
+  values; RT dose and a blending presentation state set their own curve (the
+  VOI LUT Function, linear when absent) instead of the default.
 
 ---
 
@@ -126,14 +141,21 @@ applied only at composite time.
   is where the scale is read. It is labelled in the display unit (SUVbw when
   known). `FusionOp.getColorScale()` exposes the exact window and LUT being
   painted, so the bar cannot drift from the rendering.
-- **Scale maximum.** `FusionWindowListener` (`FusionAction.WINDOW_TOP`, the
-  slider of the Fusion panel) moves the top of the window through
-  `FusionController.applyWindowTop`, bottom unchanged. `FusionScaleDragHandler`
-  (registered in `View2d.iniDefaultMouseListener`, after `FocusHandler`)
-  consumes a left press on the area where the bar was last painted (a view
-  client property) and drives the same slider, so the mouse action bound to
-  the button does not run. A window set by any other path refreshes the slider
-  via `EventManager.refreshFusionWindowControl`.
+- **Scale maximum and minimum.** Two `FusionWindowListener` sliders of the
+  Fusion panel (`FusionAction.WINDOW_TOP`, `FusionAction.WINDOW_BOTTOM`) move
+  one end of the window through `FusionController.applyWindowTop` /
+  `applyWindowBottom`. `FusionScaleDragHandler` (registered in
+  `View2d.iniDefaultMouseListener`, after `FocusHandler`) consumes a left
+  press on the area where the bar was last painted (a view client property),
+  so the mouse action bound to the button does not run: the upper end of the
+  bar moves the top, the lower end the bottom, the body slides the window.
+  Every path ends in `FusionController.applyWindow`, which applies the window
+  to the panes sharing it and re-syncs both sliders through
+  `EventManager.refreshFusionWindowControl` (the slider driving the change
+  skips its own re-sync). The gesture arithmetic and its bounds — the same as
+  the slider ranges — live in `FusionWindowGestures`.
+- **Bar length.** One pixel per LUT entry in a tall view; shorter in a small
+  cell (the MPR fusion layout), down to a minimum below which it is hidden.
 - **Measurements.** An area measurement on the fused base image also reports
   overlay statistics through `FusionMeasurableLayer` (`FusionOp.getStatsLayer`).
   For coplanar series the ROI is mapped onto the native PET slice and
@@ -157,8 +179,24 @@ User selects overlay series (EventManager FusionAction.SERIES)
                         build started, never one the user set meanwhile
 ```
 
-- Fusion is **per-view**; MPR is the exception — its three panes take every
+- Fusion is **per-view**; MPR is the exception — its panes take every
   change together.
+- **What a view shows** is the per-view `FusionOp.P_FUSION_DISPLAY`
+  (`FusionDisplay`), never shared by `applyParam`: `FUSED` by default, `BASE`
+  (the op passes the base image through, no color bar, no overlay statistics)
+  or `OVERLAY` (the overlay alone in opaque inverted gray, whatever the color
+  LUT, and without color bar: white at and below the window bottom, black at
+  and above its top, as nuclear medicine reads it). The MPR fusion layouts use
+  them (see `mpr-architecture.md`). Window and transfer function are shared by every
+  row, so the gray overlay and the fused colors change contrast together; the
+  color LUT only reaches the fused views. On a pane showing the overlay alone,
+  `FusionWindowLevelHandler` turns the window/level mouse action into a
+  window/level of the overlay; `InfoLayer` reports that window instead of the
+  base one.
+- **Defaults.** Spectrum palette for a nuclear medicine overlay (NM, PT;
+  `FusionAction.spectrum` finds it by name), the map flagged as default for
+  the other modalities, inverse logarithm transfer function, 50 % overlay
+  opacity (`FusionOp.DEFAULT_OVERLAY_OPACITY`).
 - A 2D view's fusion state is snapshot (`FusionState`) and re-applied when
   an MPR of the same series opens, reusing the already-built volume.
 - `RESET_DISPLAY` turns fusion off and releases the volume reference;
@@ -176,7 +214,9 @@ User selects overlay series (EventManager FusionAction.SERIES)
    `getImagePosition` are exact inverses with TLHC = center of pixel (0,0);
    `Volume.lpsToVoxel` must stay the exact inverse of the volume writes.
 3. **Opacity is composite-time only.** Nothing opacity-dependent may be
-   baked into a cached overlay.
+   baked into a cached overlay. The display mode is baked in (opaque LUT for
+   the overlay alone), so changing it goes through
+   `FusionController.setDisplay`, which clears the caches.
 4. **Cache invalidation** on series / LUT / window / volume change goes
    through `FusionController` — a new invalidating parameter must be added
    to `applyParam`'s `clearCache` set.

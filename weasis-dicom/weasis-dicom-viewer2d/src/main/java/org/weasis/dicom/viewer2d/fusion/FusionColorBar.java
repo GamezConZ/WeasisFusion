@@ -26,9 +26,9 @@ import org.weasis.dicom.codec.DicomImageElement;
 
 /**
  * Draws the overlay color scale on a fused view: the place where the display window, derived from
- * the series or the color map, can be read. Dragging the bar vertically moves the top of the window
- * (see {@link FusionScaleDragHandler}); the area it was last painted in is kept on the view for
- * that.
+ * the series or the color map, can be read. Dragging the bar vertically adjusts the window (see
+ * {@link FusionScaleDragHandler}): its upper end moves the top, its lower end the bottom, and its
+ * body slides the whole window. The area it was last painted in is kept on the view for that.
  *
  * <p>It is labelled in the unit the overlay actually carries — SUVbw when it could be computed, the
  * raw DICOM pixel value unit otherwise, and a percentage of the data maximum when even that is
@@ -46,8 +46,17 @@ public final class FusionColorBar {
   /** Target number of labelled intervals; the rounded tick step decides the actual count. */
   private static final int TICKS = 4;
 
-  /** Below this height the bar would overlap the corner annotations. */
-  private static final int MIN_VIEW_HEIGHT = 350;
+  /** Height kept free above and below the bar for the corner annotations. */
+  private static final int RESERVED_HEIGHT = 94;
+
+  /**
+   * Below this length the bar is too short to be read or grabbed, and the view too small for it to
+   * clear the corner annotations.
+   */
+  private static final int MIN_BAR_LENGTH = 128;
+
+  /** Fraction of the bar, at each end, that grabs that end rather than the body. */
+  private static final double END_GRIP = 0.25;
 
   /** Left shift applied when the base image LUT bar already occupies the right edge. */
   private static final int LUT_BAR_SHIFT = 70;
@@ -57,6 +66,13 @@ public final class FusionColorBar {
 
   /** Client property of the view holding the area where the bar was last painted. */
   private static final String HIT_AREA = "fusion.colorBar.area"; // NON-NLS
+
+  /** The part of the bar a drag starts from, deciding what the drag moves. */
+  public enum Grip {
+    TOP,
+    BODY,
+    BOTTOM
+  }
 
   private FusionColorBar() {}
 
@@ -69,7 +85,8 @@ public final class FusionColorBar {
       Rectangle bound,
       float midFontHeight,
       boolean baseLutBarVisible) {
-    if (view == null || bound.height <= MIN_VIEW_HEIGHT) {
+    int length = barLength(bound.height);
+    if (view == null || length < MIN_BAR_LENGTH) {
       return;
     }
     FusionColorScale scale =
@@ -81,7 +98,6 @@ public final class FusionColorBar {
     }
 
     byte[][] lut = scale.lut().lutTable();
-    int length = ByteLutAlpha.CHANNEL_SIZE;
     float x = bound.width - 30f - eastButtonWidth(view) - (baseLutBarVisible ? LUT_BAR_SHIFT : 0);
     float y = bound.height / 2f - length / 2f;
     view.getJComponent()
@@ -96,7 +112,7 @@ public final class FusionColorBar {
     Rectangle2D.Float rect = new Rectangle2D.Float();
     // Top row is the window maximum: walk the LUT downwards.
     for (int row = 0; row < length; row++) {
-      int entry = length - 1 - row;
+      int entry = lutEntry(length - 1 - row, length);
       if (lut[ByteLutAlpha.A][entry] == 0) {
         continue;
       }
@@ -124,8 +140,54 @@ public final class FusionColorBar {
 
   /** {@code true} when {@code point} (view coordinates) is on the bar as last painted. */
   public static boolean isOnBar(ViewCanvas<?> view, Point point) {
+    return hitArea(view) instanceof Rectangle2D area && area.contains(point);
+  }
+
+  /**
+   * The part of the bar under {@code point} (view coordinates), or {@code null} when off the bar.
+   */
+  public static Grip gripAt(ViewCanvas<?> view, Point point) {
+    Rectangle2D area = hitArea(view);
+    if (area == null || !area.contains(point)) {
+      return null;
+    }
+    return gripAt((point.getY() - area.getY()) / area.getHeight());
+  }
+
+  /** The part of the bar at {@code fraction} of its height, from the top. */
+  static Grip gripAt(double fraction) {
+    if (fraction < END_GRIP) {
+      return Grip.TOP;
+    }
+    return fraction > 1.0 - END_GRIP ? Grip.BOTTOM : Grip.BODY;
+  }
+
+  /** Length in pixels of the bar as last painted, or {@code 0} when it is not shown. */
+  public static double paintedLength(ViewCanvas<?> view) {
+    Rectangle2D area = hitArea(view);
+    return area == null ? 0.0 : area.getHeight() - 2.0 * GRAB_MARGIN;
+  }
+
+  private static Rectangle2D hitArea(ViewCanvas<?> view) {
     return view.getJComponent().getClientProperty(HIT_AREA) instanceof Rectangle2D area
-        && area.contains(point);
+        ? area
+        : null;
+  }
+
+  /**
+   * One pixel per LUT entry when the view is tall enough, shorter in a small cell (a 3x3 layout) so
+   * the scale stays readable there too.
+   */
+  static int barLength(int viewHeight) {
+    return Math.min(ByteLutAlpha.CHANNEL_SIZE, viewHeight - RESERVED_HEIGHT);
+  }
+
+  /** The LUT entry painted on the bar row {@code row}, counted from the bottom of the bar. */
+  static int lutEntry(int row, int length) {
+    int last = ByteLutAlpha.CHANNEL_SIZE - 1;
+    return length >= ByteLutAlpha.CHANNEL_SIZE
+        ? row
+        : (int) Math.round(row * (double) last / (length - 1));
   }
 
   /**

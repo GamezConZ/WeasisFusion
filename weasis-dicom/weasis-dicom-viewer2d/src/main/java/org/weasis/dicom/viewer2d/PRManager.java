@@ -83,6 +83,7 @@ import org.weasis.opencv.op.ImageConversion;
 import org.weasis.opencv.op.lut.ByteLut;
 import org.weasis.opencv.op.lut.ColorLut;
 import org.weasis.opencv.op.lut.DefaultWlPresentation;
+import org.weasis.opencv.op.lut.LutShape;
 import org.weasis.opencv.op.lut.colormap.ColorMap;
 import org.weasis.opencv.op.lut.colormap.ColorMapType;
 import org.weasis.opencv.op.lut.colormap.ColorStop;
@@ -257,7 +258,13 @@ public class PRManager {
     FusionController.applyState(
         List.of(view),
         new FusionState(
-            overlay, blendingPalette(pr), window, FusionOp.DEFAULT_BASE_OPACITY, opacity, null));
+            overlay,
+            blendingPalette(pr),
+            blendingShape(superimposed),
+            window,
+            FusionOp.DEFAULT_BASE_OPACITY,
+            opacity,
+            null));
   }
 
   @SuppressWarnings("unchecked")
@@ -268,6 +275,18 @@ public class PRManager {
       }
     }
     return null;
+  }
+
+  /**
+   * The VOI LUT Function of the superimposed layer, linear when absent (PS3.3 C.11.2.1.3): the
+   * blending state fixes how its window maps to the palette, so the default curve of the fusion
+   * controls does not apply.
+   */
+  private static LutShape blendingShape(BlendingLayer layer) {
+    VoiLutModule voi = layer.voiLut();
+    LutShape shape =
+        voi == null ? null : voi.getVoiLutFunction().map(LutShape::getLutShape).orElse(null);
+    return shape == null ? LutShape.LINEAR : shape;
   }
 
   // The superimposed layer's window, else the overlay's own default window.

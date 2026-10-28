@@ -158,7 +158,14 @@ public class EventManager extends ImageViewerEventManager<DicomImageElement>
   private final ShortcutActions mprShortcuts = buildMprShortcuts();
   private final FusionOpacityListener fusionBaseOpacity;
   private final FusionOpacityListener fusionOverlayOpacity;
-  private final FusionWindowListener fusionWindowTop = new FusionWindowListener();
+
+  /** Overlay modalities read as nuclear medicine, whose fusion defaults to Spectrum. */
+  private static final List<String> NUCLEAR_MEDICINE = List.of("NM", "PT"); // NON-NLS
+
+  private final FusionWindowListener fusionWindowTop =
+      new FusionWindowListener(FusionWindowListener.Bound.TOP);
+  private final FusionWindowListener fusionWindowBottom =
+      new FusionWindowListener(FusionWindowListener.Bound.BOTTOM);
 
   /**
    * Return the single instance of this class. This method guarantees the singleton property of this
@@ -219,6 +226,7 @@ public class EventManager extends ImageViewerEventManager<DicomImageElement>
     setAction(newFusionEnableAction());
     setAction(newFusionSeriesAction());
     setAction(newFusionLutAction());
+    setAction(newFusionLutShapeAction());
     fusionBaseOpacity =
         new FusionOpacityListener(
             FusionAction.BASE_OPACITY,
@@ -234,6 +242,7 @@ public class EventManager extends ImageViewerEventManager<DicomImageElement>
     setAction(fusionBaseOpacity);
     setAction(fusionOverlayOpacity);
     setAction(fusionWindowTop);
+    setAction(fusionWindowBottom);
 
     // The regions of the device library depend on the mask in force and on the document itself
     IdentityMask.addChangeListener(() -> GuiExecutor.execute(RedactionToolBar::refreshOpenViews));
@@ -668,6 +677,11 @@ public class EventManager extends ImageViewerEventManager<DicomImageElement>
         if (selected) {
           getAction(FusionAction.LUT)
               .ifPresent(a -> FusionController.applyLut(a.getSelectedItem()));
+          getAction(FusionAction.LUT_SHAPE)
+              .ifPresent(
+                  a ->
+                      FusionController.applyParam(
+                          FusionOp.P_FUSION_LUT_SHAPE, a.getSelectedItem()));
           // The series combo is populated without triggering its listener, so push the current
           // selection to the op here; otherwise the overlay has no PET series and stays hidden.
           getAction(FusionAction.SERIES)
@@ -696,21 +710,22 @@ public class EventManager extends ImageViewerEventManager<DicomImageElement>
     };
   }
 
-  // The map flagged as default for the overlay's modality (PET SUV, Isodose) takes over.
+  /**
+   * Spectrum takes over for a nuclear medicine overlay (NM, PT); for the others the map flagged as
+   * default for their modality (Isodose for a dose grid).
+   */
   private void selectDefaultFusionLut(String modality) {
     ColorMapRegistry registry = ColorMapRegistry.getInstance();
-    registry
-        .defaultFor(modality)
-        .map(registry::byteLut)
+    getAction(FusionAction.LUT)
         .ifPresent(
-            lut ->
-                getAction(FusionAction.LUT)
-                    .ifPresent(
-                        a -> {
-                          if (Arrays.asList(a.getAllItem()).contains(lut)) {
-                            a.setSelectedItem(lut);
-                          }
-                        }));
+            a -> {
+              List<Object> items = Arrays.asList(a.getAllItem());
+              Optional<ByteLut> lut =
+                  NUCLEAR_MEDICINE.contains(modality)
+                      ? FusionAction.spectrum(items)
+                      : registry.defaultFor(modality).map(registry::byteLut);
+              lut.filter(items::contains).ifPresent(a::setSelectedItem);
+            });
   }
 
   /**
@@ -724,6 +739,25 @@ public class EventManager extends ImageViewerEventManager<DicomImageElement>
     }
   }
 
+  /**
+   * Transfer function of the overlay window, shared by the fused overlay and the overlay alone; the
+   * curves of the base image window, inverse logarithm by default (see {@link
+   * FusionOp#DEFAULT_LUT_SHAPE}).
+   */
+  private ComboItemListener<LutShape> newFusionLutShapeAction() {
+    ComboItemListener<LutShape> action =
+        new ComboItemListener<>(
+            FusionAction.LUT_SHAPE,
+            DicomImageElement.DEFAULT_LUT_FUNCTIONS.toArray(new LutShape[0])) {
+          @Override
+          public void itemStateChanged(Object object) {
+            FusionController.applyParam(FusionOp.P_FUSION_LUT_SHAPE, object);
+          }
+        };
+    action.setSelectedItemWithoutTriggerAction(FusionOp.DEFAULT_LUT_SHAPE);
+    return action;
+  }
+
   private ComboItemListener<ByteLut> newFusionLutAction() {
     ByteLut[] luts = fusionLutList();
     ComboItemListener<ByteLut> action =
@@ -733,11 +767,14 @@ public class EventManager extends ImageViewerEventManager<DicomImageElement>
             FusionController.applyLut(object);
           }
         };
-    // The map flagged as PT default (an SUVbw preset), else the hot-metal PET palette.
+    // Spectrum, else the map flagged as PT default (an SUVbw preset), else the hot-metal palette.
     ByteLut preferred =
-        ColorMapRegistry.getInstance()
-            .defaultFor("PT") // NON-NLS
-            .map(ColorMapRegistry.getInstance()::byteLut)
+        FusionAction.spectrum(Arrays.asList(luts))
+            .or(
+                () ->
+                    ColorMapRegistry.getInstance()
+                        .defaultFor("PT") // NON-NLS
+                        .map(ColorMapRegistry.getInstance()::byteLut))
             .orElse(null);
     for (ByteLut lut : luts) {
       if (lut.equals(preferred) || (preferred == null && "PET".equals(lut.name()))) { // NON-NLS
@@ -849,6 +886,14 @@ public class EventManager extends ImageViewerEventManager<DicomImageElement>
                 disOp
                     .getParamValue(FusionOp.OP_NAME, FusionOp.P_FUSION_LUT)
                     .ifPresent(a::setSelectedItemWithoutTriggerAction));
+    getAction(FusionAction.LUT_SHAPE)
+        .ifPresent(
+            a ->
+                a.setSelectedItemWithoutTriggerAction(
+                    disOp
+                        .getParamValue(
+                            FusionOp.OP_NAME, FusionOp.P_FUSION_LUT_SHAPE, LutShape.class)
+                        .orElse(FusionOp.DEFAULT_LUT_SHAPE)));
 
     // Title each opacity slider with the real modality of the layer it controls.
     fusionBaseOpacity.setModalityLabel(FusionController.baseModality(view2d));
@@ -860,22 +905,25 @@ public class EventManager extends ImageViewerEventManager<DicomImageElement>
     fusionOverlayOpacity.setSliderValue(
         toFusionPercent(disOp, FusionOp.P_OPACITY_OVERLAY, FusionOp.DEFAULT_OVERLAY_OPACITY),
         false);
-    syncFusionWindowTop(view2d);
+    syncFusionWindow(view2d);
 
     setFusionControlsEnabled(enabled);
   }
 
   /**
-   * Re-syncs the scale maximum slider with the selected view after its window was set elsewhere
-   * (series default, color map, refined volume measure).
+   * Re-syncs the scale sliders with the selected view after its window was set elsewhere (series
+   * default, color map, refined volume measure, color bar drag, the other scale slider).
    */
   public void refreshFusionWindowControl() {
-    syncFusionWindowTop(getSelectedViewPane());
+    syncFusionWindow(getSelectedViewPane());
   }
 
-  private void syncFusionWindowTop(ViewCanvas<DicomImageElement> view) {
+  private void syncFusionWindow(ViewCanvas<DicomImageElement> view) {
     if (view != null) {
-      fusionWindowTop.sync(FusionController.windowOf(view), FusionController.windowTopLimit(view));
+      FusionWindow window = FusionController.windowOf(view);
+      double topLimit = FusionController.windowTopLimit(view);
+      fusionWindowTop.sync(window, topLimit);
+      fusionWindowBottom.sync(window, topLimit);
     }
   }
 
@@ -896,9 +944,11 @@ public class EventManager extends ImageViewerEventManager<DicomImageElement>
   private void setFusionControlsEnabled(boolean enabled) {
     getAction(FusionAction.SERIES).ifPresent(a -> a.enableAction(enabled));
     getAction(FusionAction.LUT).ifPresent(a -> a.enableAction(enabled));
+    getAction(FusionAction.LUT_SHAPE).ifPresent(a -> a.enableAction(enabled));
     getAction(FusionAction.BASE_OPACITY).ifPresent(a -> a.enableAction(enabled));
     getAction(FusionAction.OVERLAY_OPACITY).ifPresent(a -> a.enableAction(enabled));
     fusionWindowTop.enableAction(enabled);
+    fusionWindowBottom.enableAction(enabled);
   }
 
   // ---  End of Fusion actions ------------------------------------------------------------------

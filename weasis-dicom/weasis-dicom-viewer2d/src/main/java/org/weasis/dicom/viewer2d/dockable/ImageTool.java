@@ -379,6 +379,16 @@ public class ImageTool extends PluginTool {
             });
 
     manager
+        .getAction(FusionAction.LUT_SHAPE)
+        .ifPresent(
+            a -> {
+              JLabel label =
+                  new JLabel(Messages.getString("FusionTool.lutShape") + StringUtil.COLON);
+              fusionPanel.add(GuiUtils.getHorizontalBoxLayoutPanel(5, label, a.createCombo(160)));
+              fusionPanel.add(GuiUtils.boxVerticalStrut(gabY));
+            });
+
+    manager
         .getAction(FusionAction.BASE_OPACITY)
         .ifPresent(
             a -> {
@@ -400,6 +410,16 @@ public class ImageTool extends PluginTool {
 
     manager
         .getAction(FusionAction.WINDOW_TOP)
+        .ifPresent(
+            a -> {
+              JSliderW slider = a.createSlider(0, true);
+              GuiUtils.setPreferredWidth(slider, 100);
+              fusionPanel.add(slider);
+              fusionPanel.add(GuiUtils.boxVerticalStrut(gabY));
+            });
+
+    manager
+        .getAction(FusionAction.WINDOW_BOTTOM)
         .ifPresent(
             a -> {
               JSliderW slider = a.createSlider(0, true);

@@ -59,6 +59,9 @@ import org.weasis.dicom.codec.geometry.PatientOrientation.Biped;
 import org.weasis.dicom.codec.geometry.VectorUtils;
 import org.weasis.dicom.explorer.DicomModel;
 import org.weasis.dicom.viewer2d.fusion.FusionColorBar;
+import org.weasis.dicom.viewer2d.fusion.FusionController;
+import org.weasis.dicom.viewer2d.fusion.FusionDisplay;
+import org.weasis.dicom.viewer2d.fusion.FusionWindow;
 import org.weasis.dicom.viewer2d.mpr.MprController;
 import org.weasis.dicom.viewer2d.mpr.MprView;
 import org.weasis.opencv.data.PlanarImage;
@@ -264,7 +267,10 @@ public class InfoLayer extends AbstractInfoLayer<DicomImageElement> {
       drawY = paintPixelInfo(g2, drawY, fontHeight);
     }
     if (getDisplayPreferences(LayerItem.WINDOW_LEVEL) && hideMin) {
-      drawY = paintWindowLevel(g2, image, disOp, drawY, fontHeight);
+      drawY =
+          FusionController.displayOf(view2DPane) == FusionDisplay.OVERLAY
+              ? paintOverlayWindow(g2, drawY, fontHeight)
+              : paintWindowLevel(g2, image, disOp, drawY, fontHeight);
     }
     if (getDisplayPreferences(LayerItem.ZOOM) && hideMin) {
       drawY = paintZoom(g2, drawY, fontHeight);
@@ -358,6 +364,22 @@ public class InfoLayer extends AbstractInfoLayer<DicomImageElement> {
     double maxp = level.doubleValue() + window.doubleValue() / 2.0;
 
     return minp > maxModLUT || maxp < minModLUT;
+  }
+
+  /**
+   * The overlay window as a window/level pair in its display unit: a view showing the overlay alone
+   * does not show the base image, so its window would be read as the overlay's.
+   */
+  private float paintOverlayWindow(Graphics2D g2, float drawY, int fontHeight) {
+    FusionWindow window = FusionController.windowOf(view2DPane);
+    if (window != null) {
+      String text = buildWindowLevelText(window.displayWidth(), window.displayCenter(), false);
+      if (StringUtil.hasText(window.displayUnit())) {
+        text += StringUtil.SPACE + window.displayUnit();
+      }
+      FontTools.paintFontOutline(g2, text, border, drawY);
+    }
+    return drawY - fontHeight;
   }
 
   private String buildWindowLevelText(Number window, Number level, boolean outside) {

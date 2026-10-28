@@ -15,28 +15,52 @@ import org.weasis.core.api.gui.util.SliderChangeListener;
 import org.weasis.core.util.StringUtil;
 
 /**
- * Slider moving the top of the overlay display window, in the unit the {@link FusionColorBar} reads
- * (SUVbw when known). The bottom stays where the series or the color map put it, so the scale is
- * read from zero as nuclear medicine does. Dragging the color bar drives this same slider.
+ * Slider moving one end of the overlay display window, in the unit the {@link FusionColorBar} reads
+ * (SUVbw when known). The top slider sets the scale maximum; the bottom slider sets the scale
+ * minimum, the background threshold of SPECT reading, which nuclear medicine otherwise reads from
+ * zero. Dragging the color bar and the window/level action on the overlay alone move the same
+ * window, and both sliders follow.
  */
 public class FusionWindowListener extends SliderChangeListener {
 
+  /** The end of the window a slider moves. */
+  public enum Bound {
+    BOTTOM,
+    TOP
+  }
+
   private static final int SLIDER_RANGE = 1000;
 
-  /**
-   * Fraction of the range kept between the bottom and the lowest top, so the window never closes.
-   */
-  private static final double MIN_SPAN = 0.01;
-
+  private final Bound bound;
   private String unit = StringUtil.EMPTY_STRING;
+  private boolean applying;
 
-  public FusionWindowListener() {
-    super(FusionAction.WINDOW_TOP, 0.0, 1.0, 1.0, true, 1.0, SLIDER_RANGE);
+  public FusionWindowListener(Bound bound) {
+    super(
+        bound == Bound.TOP ? FusionAction.WINDOW_TOP : FusionAction.WINDOW_BOTTOM,
+        0.0,
+        1.0,
+        bound == Bound.TOP ? 1.0 : 0.0,
+        true,
+        1.0,
+        SLIDER_RANGE);
+    this.bound = bound;
   }
 
   @Override
   public void stateChanged(BoundedRangeModel model) {
-    FusionController.applyWindowTop(toModelValue(model.getValue()));
+    // The other slider follows the new window; this one is the source and is left alone.
+    applying = true;
+    try {
+      double value = toModelValue(model.getValue());
+      if (bound == Bound.TOP) {
+        FusionController.applyWindowTop(value);
+      } else {
+        FusionController.applyWindowBottom(value);
+      }
+    } finally {
+      applying = false;
+    }
   }
 
   @Override
@@ -47,16 +71,25 @@ public class FusionWindowListener extends SliderChangeListener {
   }
 
   /**
-   * Follows {@code window} without applying anything: the range goes from just above its bottom to
-   * {@code topLimit}, both in the display unit.
+   * Follows {@code window} without applying anything, both in the display unit: the top ranges from
+   * just above the bottom to {@code topLimit}, the bottom from {@link
+   * FusionWindow#displayBottomLimit()} to just below the top.
    */
   public void sync(FusionWindow window, double topLimit) {
-    if (window == null || !Double.isFinite(topLimit)) {
+    if (applying || window == null || !Double.isFinite(topLimit)) {
       return;
     }
     unit = window.displayUnit();
-    double bottom = window.displayMin();
-    double top = Math.max(topLimit, window.displayMax());
-    setRealMinMaxValue(bottom + (top - bottom) * MIN_SPAN, top, window.displayMax(), false);
+    if (bound == Bound.TOP) {
+      double bottom = window.displayMin();
+      double top = Math.max(topLimit, window.displayMax());
+      setRealMinMaxValue(
+          bottom + (top - bottom) * FusionWindowGestures.MIN_SPAN, top, window.displayMax(), false);
+    } else {
+      double lowest = window.displayBottomLimit();
+      double top = window.displayMax();
+      setRealMinMaxValue(
+          lowest, top - (top - lowest) * FusionWindowGestures.MIN_SPAN, window.displayMin(), false);
+    }
   }
 }

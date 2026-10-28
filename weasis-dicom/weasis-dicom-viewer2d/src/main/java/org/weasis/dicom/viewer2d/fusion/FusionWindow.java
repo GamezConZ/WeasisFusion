@@ -28,8 +28,10 @@ import org.weasis.opencv.op.lut.colormap.ColorMapDomain;
  * {@link TagW#SuvFactor}, the raw DICOM pixel value unit otherwise.
  *
  * <p>It is derived from the series (or declared by the color map) and the reader can then move its
- * top, from the fusion panel or by dragging the {@link FusionColorBar}; the bottom stays where it
- * was set.
+ * top and its bottom, from the fusion panel, by dragging the {@link FusionColorBar} or with the
+ * window/level mouse action on a view showing the overlay alone (see {@link FusionWindowGestures}).
+ * Raising the bottom is the background threshold of SPECT reading, where counts carry no unit to
+ * anchor the scale.
  *
  * @param min the real value mapped to the bottom of the LUT (fully transparent)
  * @param max the real value mapped to the top of the LUT
@@ -236,6 +238,39 @@ public record FusionWindow(double min, double max, double displayFactor, String 
    */
   public FusionWindow withDisplayMax(double displayMax) {
     return new FusionWindow(min, displayMax / displayFactor, displayFactor, displayUnit);
+  }
+
+  /**
+   * This window with its bottom moved to {@code displayMin} (in the display unit), the top
+   * unchanged.
+   */
+  public FusionWindow withDisplayMin(double displayMin) {
+    return new FusionWindow(displayMin / displayFactor, max, displayFactor, displayUnit);
+  }
+
+  /** This window spanning {@code displayMin} to {@code displayMax}, both in the display unit. */
+  public FusionWindow withDisplayRange(double displayMin, double displayMax) {
+    return new FusionWindow(
+        displayMin / displayFactor, displayMax / displayFactor, displayFactor, displayUnit);
+  }
+
+  /**
+   * Lowest bottom the reader can give this window, in the display unit: zero, since activity is a
+   * non-negative quantity, unless the window already starts below it (a map declaring a negative
+   * bottom).
+   */
+  public double displayBottomLimit() {
+    return Math.min(0.0, displayMin());
+  }
+
+  /** Middle of the window in the display unit: the level of a window/level pair. */
+  public double displayCenter() {
+    return (displayMin() + displayMax()) / 2.0;
+  }
+
+  /** Span of the window in the display unit: the width of a window/level pair. */
+  public double displayWidth() {
+    return displayMax() - displayMin();
   }
 
   /**

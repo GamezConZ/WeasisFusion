@@ -92,6 +92,7 @@ import org.weasis.dicom.viewer2d.fusion.FusionState;
 import org.weasis.dicom.viewer2d.fusion.FusionWindow;
 import org.weasis.opencv.op.lut.ByteLut;
 import org.weasis.opencv.op.lut.ColorLut;
+import org.weasis.opencv.op.lut.LutShape;
 import org.weasis.opencv.op.lut.colormap.ColorMap;
 import org.weasis.opencv.seg.RegionAttributes;
 
@@ -803,6 +804,8 @@ public class RtDisplayTool extends PluginTool implements SeriesViewerListener, S
         new FusionState(
             doseSeries,
             lut,
+            // Dose reads linearly: the isodose levels are fractions of the prescribed dose.
+            LutShape.LINEAR,
             window,
             FusionOp.DEFAULT_BASE_OPACITY,
             FusionOp.DEFAULT_OVERLAY_OPACITY,

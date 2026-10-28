@@ -146,10 +146,8 @@ public class AxesControl {
   }
 
   public void refreshAllCanvases() {
-    for (SliceCanvas c : controller.getMprViews()) {
-      if (c != null) {
-        c.getJComponent().repaint();
-      }
+    for (SliceCanvas c : controller.getAllViews()) {
+      c.getJComponent().repaint();
     }
 
     for (SliceCanvas c : watchingCanvases) {

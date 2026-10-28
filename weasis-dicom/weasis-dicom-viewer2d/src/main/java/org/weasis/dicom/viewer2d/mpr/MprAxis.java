@@ -11,10 +11,14 @@ package org.weasis.dicom.viewer2d.mpr;
 
 import java.awt.Color;
 import java.beans.PropertyChangeListener;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Objects;
 import org.joml.Matrix4d;
 import org.joml.Quaterniond;
 import org.joml.Vector3d;
+import org.weasis.core.api.gui.model.ViewModel;
+import org.weasis.core.api.gui.model.ViewModelChangeListener;
 import org.weasis.core.api.image.measure.PlaneGeometry;
 import org.weasis.core.api.media.data.TagW;
 import org.weasis.core.ui.model.GraphicModel;
@@ -27,12 +31,21 @@ import org.weasis.dicom.viewer2d.View2d;
 import org.weasis.dicom.viewer2d.mip.MipView.Type;
 import org.weasis.dicom.viewer2d.mpr.MprView.Plane;
 
+/**
+ * One plane of the MPR: its reslice transform, slice index and MIP thickness, and the views showing
+ * it. The slice is rendered once, through the primary view ({@link #getMprView()}); linked views
+ * (the other rows of the fusion layout) display the same image element, so they share its slice,
+ * its pinned cache entry and its graphics, and keep the zoom and the pan of the primary.
+ */
 public class MprAxis {
 
   private final Plane plane;
   private final AxisDirection axisDirection;
   private final Matrix4d transformation;
+  private final ViewModelChangeListener columnLink = this::followViewModel;
   private MprView mprView;
+  private List<MprView> linkedViews = List.of();
+  private boolean following;
   private VolImageIO rawIO;
   private DicomImageElement imageElement;
   private int thicknessExtension;
@@ -221,7 +234,75 @@ public class MprAxis {
       mprView.updateSegmentation();
       // mprView.center();
       mprView.repaint();
+      // After the graphics: the linked views take the model the primary view now has.
+      linkedViews.forEach(this::showImage);
     }
+  }
+
+  /** Shows the current slice in a linked view, without reslicing it again. */
+  private void showImage(MprView view) {
+    view.getImageLayer().setImage(null, null);
+    view.setImage(imageElement);
+    view.repaint();
+  }
+
+  /**
+   * Views of this plane showing the image of the primary view as well; empty outside the fusion
+   * layouts. They take the zoom and the pan of the primary view at once, then any view of the
+   * column carries its own to the others.
+   */
+  public void setLinkedViews(List<MprView> views) {
+    getViews().forEach(v -> v.getViewModel().removeViewModelChangeListener(columnLink));
+    linkedViews = List.copyOf(views);
+    if (!linkedViews.isEmpty()) {
+      getViews().forEach(v -> v.getViewModel().addViewModelChangeListener(columnLink));
+      if (mprView != null) {
+        followViewModel(mprView.getViewModel());
+      }
+    }
+  }
+
+  public List<MprView> getLinkedViews() {
+    return linkedViews;
+  }
+
+  /** The primary view followed by the linked views. */
+  public List<MprView> getViews() {
+    List<MprView> views = new ArrayList<>(linkedViews.size() + 1);
+    if (mprView != null) {
+      views.add(mprView);
+    }
+    linkedViews.stream().filter(v -> v != mprView).forEach(views::add);
+    return views;
+  }
+
+  public void repaintViews() {
+    getViews().forEach(MprView::repaint);
+  }
+
+  /** Gives the zoom and the pan of the view whose model changed to the other views of the plane. */
+  private void followViewModel(ViewModel model) {
+    List<MprView> views = getViews();
+    MprView source = views.stream().filter(v -> v.getViewModel() == model).findFirst().orElse(null);
+    if (following || source == null) {
+      return;
+    }
+    following = true;
+    try {
+      for (MprView view : views) {
+        if (view != source && !sameViewport(view.getViewModel(), model)) {
+          view.followViewport(source);
+        }
+      }
+    } finally {
+      following = false;
+    }
+  }
+
+  private static boolean sameViewport(ViewModel a, ViewModel b) {
+    return a.getViewScale() == b.getViewScale()
+        && a.getModelOffsetX() == b.getModelOffsetX()
+        && a.getModelOffsetY() == b.getModelOffsetY();
   }
 
   /** Basic volume without patient geometry: the model is kept per exact plane, as before. */
@@ -252,7 +333,7 @@ public class MprAxis {
     PlaneGeometry geometry = mprView == null ? null : imageElement.getPlaneGeometry();
     if (geometry != null) {
       mprView.mprController.getGraphicStore().refreshFootprints(mprView, geometry, halfThickness());
-      mprView.repaint();
+      repaintViews();
     }
   }
 

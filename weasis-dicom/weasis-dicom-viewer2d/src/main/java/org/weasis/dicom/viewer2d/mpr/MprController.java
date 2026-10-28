@@ -189,6 +189,43 @@ public class MprController
     return List.of(axial.getMprView(), coronal.getMprView(), sagittal.getMprView());
   }
 
+  /** Every view of the volume: the primary view of each plane and the views linked to it. */
+  public List<MprView> getAllViews() {
+    return Stream.of(axial, coronal, sagittal).flatMap(a -> a.getViews().stream()).toList();
+  }
+
+  /** Repaints every view: they all draw the crosshair lines from the shared center. */
+  public void repaintAllViews() {
+    getAllViews().forEach(MprView::repaint);
+  }
+
+  /** {@code true} when a plane is shown in several views (the fusion layout). */
+  public boolean hasLinkedViews() {
+    return Stream.of(axial, coronal, sagittal).anyMatch(a -> !a.getLinkedViews().isEmpty());
+  }
+
+  /**
+   * Pans the views of the two other planes by the displacement, in the volume, of a pan of {@code
+   * source} by ({@code dx}, {@code dy}) in its image: in the fusion layout the nine views keep
+   * framing the same anatomy. Each plane carries the pan to its linked views.
+   */
+  public void panOtherPlanes(MprView source, double dx, double dy) {
+    if (volume == null) {
+      return;
+    }
+    Vector3d origin = source.getVolumeCoordinates(new Vector3d());
+    Vector3d moved = source.getVolumeCoordinates(new Vector3d(dx, dy, 0));
+    for (MprAxis axis : List.of(axial, coronal, sagittal)) {
+      MprView view = axis.getMprView();
+      if (view == null || axis.getPlane() == source.getPlane()) {
+        continue;
+      }
+      Vector3d from = axesControl.getCenterForCanvas(view, origin);
+      Vector3d to = axesControl.getCenterForCanvas(view, moved);
+      view.moveOrigin(to.x - from.x, to.y - from.y);
+    }
+  }
+
   public Volume<?, ?> getVolume() {
     return volume;
   }
@@ -352,9 +389,10 @@ public class MprController
                             MprView view = container.getMprView(plane);
                             if (view != null) {
                               view.updateSegmentation();
-                              view.repaint();
                             }
                           }
+                          // The linked views share the graphic model of the primary view.
+                          repaintAllViews();
                           // Refresh the Segmentation Tool tree if this MPR container is currently
                           // selected so that initTreeValues picks up the newly-built segElements.
                           if (container.equals(
@@ -384,15 +422,9 @@ public class MprController
     return future;
   }
 
-  private static void repaintMprViews(MprContainer container) {
-    if (container == null) {
-      return;
-    }
-    for (Plane plane : Plane.values()) {
-      MprView view = container.getMprView(plane);
-      if (view != null) {
-        view.repaint();
-      }
+  private void repaintMprViews(MprContainer container) {
+    if (container != null) {
+      repaintAllViews();
     }
   }
 
@@ -611,8 +643,8 @@ public class MprController
 
         Pair<MprAxis, MprAxis> pair = getCrossAxis(axis);
         if (pair != null) {
-          pair.first().getMprView().repaint();
-          pair.second().getMprView().repaint();
+          pair.first().repaintViews();
+          pair.second().repaintViews();
         }
       }
       e.consume();
@@ -797,7 +829,8 @@ public class MprController
         }
 
         if (oldSelectedAxis != selectedAxis) {
-          view.repaint();
+          // The highlighted line is drawn in every view of the plane.
+          axis.repaintViews();
         }
       }
     }
@@ -868,6 +901,7 @@ public class MprController
       Point2D extPoint = GeomUtil.getPerpendicularPointToLine(line, point);
       axis.setThicknessExtension((int) Math.round(pt.distance(extPoint)));
       axis.updateImage();
+      repaintAllViews();
     }
   }
 
@@ -907,7 +941,7 @@ public class MprController
       pair.second().updateImage();
       center(view);
     }
-    view.repaint();
+    repaintAllViews();
 
     fireCrossHairChanged();
   }
@@ -935,7 +969,7 @@ public class MprController
       Point2D newCenter = GeomUtil.getPerpendicularPointFromLine(center, pta, center, distance);
       updatePosition(view, newCenter, crossHair);
     }
-    view.repaint();
+    repaintAllViews();
   }
 
   protected void setNewCenter(MprView view, Vector3d newCenter) {
@@ -957,7 +991,7 @@ public class MprController
       pair.second().updateImage();
       center(view);
     }
-    view.repaint();
+    repaintAllViews();
     fireCrossHairChanged();
   }
 
@@ -988,7 +1022,7 @@ public class MprController
       double my = pt.getY() - dim.getHeight() * 0.5;
       view.setCenter(mx, my);
     } else {
-      view.repaint();
+      axis.repaintViews();
     }
   }
 

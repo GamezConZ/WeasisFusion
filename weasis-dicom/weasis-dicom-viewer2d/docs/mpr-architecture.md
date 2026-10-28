@@ -49,11 +49,12 @@ from a 3D volume and lets the user:
 
 | Class | Responsibility |
 |---|---|
-| `MprContainer` | Top-level viewer; creates the three views |
+| `MprContainer` | Top-level viewer; creates the views, gives them their role in the layout and links the views of a plane |
 | `MprView` | Swing panel (extends `View2d`, implements `SliceCanvas`) showing one `Plane`; converts mouse ↔ model coordinates and draws the crosshair |
-| `MprController` | Shared by the three views; handles all crosshair mouse interactions (move, move one line, rotate, MIP thickness) and recentering |
+| `MprController` | Shared by all the views; handles all crosshair mouse interactions (move, move one line, rotate, MIP thickness) and recentering |
 | `AxesControl` | Global crosshair state: 3D center, global rotation, per-plane rotation offsets; projects the center onto a view |
-| `MprAxis` | Links a `Plane` to its view, `VolImageIO` and image; builds the slice → volume transform; slice index and MIP thickness |
+| `MprAxis` | Links a `Plane` to its primary view, its linked views, `VolImageIO` and image; builds the slice → volume transform; slice index and MIP thickness |
+| `MprViewRole` | Plane and fusion display of a view from its rank among the MPR cells of the layout |
 | `AxisDirection` | Anatomical axis directions, colors and orientation arrows of a plane (overlay only) |
 | `Volume<?,?>` | 3D voxel data: size, spacing, slice size, sampling |
 | `VolImageIO` | Image I/O bridge that renders a slice from the volume |
@@ -196,7 +197,34 @@ marks of the other two. A volume without patient geometry (stacked, not rectifie
 previous behaviour: the model of each exact plane is kept aside and restored when that plane
 comes back.
 
-## 9. Rules for Contributors
+## 9. Fusion layouts (CT / NM / fused)
+
+`MprContainer.VIEWS_3x3_FUSION` shows each plane in a column of three rows: the base image alone,
+the functional overlay alone, then both fused. `MprContainer.VIEWS_2x3_FUSION` keeps the base row
+and the fused row. `MprViewRole` gives each view its plane and row (`FusionDisplay` — see
+[fusion-architecture.md](fusion-architecture.md)); the other layouts show each plane once, fused.
+
+- **One slice per plane.** The first view of a plane is the primary view its `MprAxis` renders
+  through; the other views of the column are linked views (`MprAxis.setLinkedViews`). They display
+  the same image element, refreshed by `MprAxis.updateImage` after the primary, so the plane is
+  resliced once. Each view pins that element in the image cache, and the reference-counted pin is
+  released when the view is disposed (see `weasis-core/docs/Memory-Management.md`). They also share
+  its graphic model, so a measurement drawn in one row shows in the others.
+- **Synchronization.** Crosshair, scroll, rotation and MIP act on the shared `AxesControl` and
+  repaint every view (`MprController.repaintAllViews`). The views of a column share their zoom
+  and pan through a view-model listener of the axis (`MprView.followViewport`, which also copies
+  the zoom action so a resize computes the same zoom again); a linked view takes the viewport of
+  the primary view as soon as it is linked. A pan made by the reader is carried to the other
+  columns by its displacement in the volume (`MprController.panOtherPlanes`). Zoom and the window
+  of the base image follow the MPR synchronization, which covers every row; the overlay window and
+  fusion settings are shared through `FusionController`.
+- **Layout switches.** Before switching to or from these layouts, the container clears every view
+  but the primary views, so they are disposed of with their pin instead of being moved into a cell
+  of another plane, row or kind; it then reassigns the roles, relinks the planes, gives the new
+  rows the fusion shown before the switch and puts every view back on the best fit, computed again
+  once the cells have their size.
+
+## 10. Rules for Contributors
 
 - **Rotation consistency.** The forward transform (display → texture,
   `MprView.getDisplayPointToTexturePointMatrix()`) and the inverse (texture → display,
