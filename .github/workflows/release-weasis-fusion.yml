@@ -1,0 +1,279 @@
+name: Release WeasisFusion
+
+# Builds the WeasisFusion packages and publishes them on a GitHub Release:
+#   Linux   AppImage, deb, rpm
+#   Windows NSIS setup (.exe), portable zip, MSI
+#   macOS   ad-hoc signed .dmg and .zip, Apple Silicon and Intel
+# Pushing a tag v*-fusion publishes the release of that tag; a manual run publishes only when a tag
+# is given, otherwise the packages stay as workflow artifacts.
+
+on:
+  push:
+    tags:
+      - 'v*-fusion'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to create or update (e.g. v4.8.0-fusion); empty for artifacts only'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+env:
+  JDK_FEATURE: '25'
+  FUSION_SCRIPTS: weasis-distributions/script/fusion
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up JDK
+        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6  # v6.0.1
+        with:
+          distribution: 'temurin'
+          java-version: ${{ env.JDK_FEATURE }}
+          cache: 'maven'
+
+      - name: Build and test with Maven
+        run: |
+          mvn -B clean install
+          mvn -B -f weasis-distributions clean package
+
+      - name: Retrieve version
+        id: version
+        run: echo "version=$(awk -F'[<>]' '/<revision>/{print $3; exit}' weasis-parent/pom.xml)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: weasis-native
+          path: weasis-distributions/target/native-dist/weasis-native.zip
+
+  linux:
+    needs: build
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.build.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up JDK (jlink, jpackage)
+        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6  # v6.0.1
+        with:
+          distribution: 'temurin'
+          java-version: ${{ env.JDK_FEATURE }}
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          name: weasis-native
+
+      - name: Download the Linux jmods and appimagetool
+        run: |
+          sudo apt-get update && sudo apt-get install -y rpm fakeroot
+          mkdir -p jmods
+          curl -sSL "https://api.adoptium.net/v3/binary/latest/$JDK_FEATURE/ga/linux/x64/jmods/hotspot/normal/eclipse" | tar xz -C jmods
+          curl -sSL -o appimagetool https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x appimagetool
+
+      - name: Build the AppImage
+        run: |
+          "$FUSION_SCRIPTS/build-appimage.sh" weasis-native.zip jmods/*-jmods ./appimagetool \
+            work-appimage "out/WeasisFusion-$VERSION-Linux-x86_64.AppImage"
+
+      - name: Build the deb and rpm packages
+        run: |
+          source "$FUSION_SCRIPTS/fusion-env.sh"
+          extract_weasis weasis-native.zip input linux-x86-64
+          link_runtime jmods/*-jmods "$(fusion_modules linux)" runtime linux
+          JOPTS=(--java-options "-splash:\$APPDIR/resources/images/about-round.png" --java-options -Dsun.awt.disablegrab=true)
+          for opt in "${JAVA_OPTIONS[@]}"; do JOPTS+=(--java-options "$opt"); done
+          for type in deb rpm; do
+            jpackage --type "$type" --input input --dest out --name "$APP_NAME" --app-version "$VERSION" \
+              --main-jar weasis-launcher.jar --main-class org.weasis.launcher.AppLauncher \
+              --runtime-image runtime --icon "$SCRIPT_DIR/resources/linux/Weasis.png" \
+              --vendor "$APP_NAME" --description "DICOM viewer with SPECT/CT and PET/CT fusion" \
+              --linux-package-name weasisfusion --linux-app-category science --linux-shortcut \
+              --linux-menu-group "Science;MedicalSoftware" "${JOPTS[@]}"
+          done
+          ls -l out
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: package-linux
+          path: out/*
+
+  windows-setup:
+    needs: build
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.build.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up JDK (jlink)
+        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6  # v6.0.1
+        with:
+          distribution: 'temurin'
+          java-version: ${{ env.JDK_FEATURE }}
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          name: weasis-native
+
+      - name: Download the Windows jmods, install mingw-w64 and NSIS
+        run: |
+          sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64 binutils-mingw-w64-x86-64 nsis
+          mkdir -p jmods
+          curl -sSL -o jmods.zip "https://api.adoptium.net/v3/binary/latest/$JDK_FEATURE/ga/windows/x64/jmods/hotspot/normal/eclipse"
+          unzip -q jmods.zip -d jmods
+
+      - name: Build the portable folder and the NSIS installer
+        run: |
+          PORTABLE="WeasisFusion-$VERSION-Windows-x86_64"
+          "$FUSION_SCRIPTS/build-windows.sh" weasis-native.zip jmods/*-jmods "work/$PORTABLE" \
+            "out/WeasisFusion-$VERSION-Windows-x86_64-Setup.exe"
+          (cd work && zip -q -r "../out/$PORTABLE-portable.zip" "$PORTABLE")
+          ls -l out
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: package-windows-setup
+          path: out/*
+
+  windows-msi:
+    needs: build
+    runs-on: windows-latest
+    env:
+      VERSION: ${{ needs.build.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up JDK (jlink, jpackage)
+        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6  # v6.0.1
+        with:
+          distribution: 'temurin'
+          java-version: ${{ env.JDK_FEATURE }}
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          name: weasis-native
+
+      - name: Install WiX Toolset
+        shell: pwsh
+        run: |
+          dotnet tool install --global wix --version "5.*"
+          echo "$env:USERPROFILE\.dotnet\tools" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          $WIX_VERSION = & "$env:USERPROFILE\.dotnet\tools\wix.exe" --version
+          & "$env:USERPROFILE\.dotnet\tools\wix.exe" extension add --global WixToolset.UI.wixext/$WIX_VERSION
+          & "$env:USERPROFILE\.dotnet\tools\wix.exe" extension add --global WixToolset.Util.wixext/$WIX_VERSION
+
+      - name: Build the MSI
+        shell: bash
+        run: |
+          mkdir -p jmods
+          curl -sSL -o jmods.zip "https://api.adoptium.net/v3/binary/latest/$JDK_FEATURE/ga/windows/x64/jmods/hotspot/normal/eclipse"
+          unzip -q jmods.zip -d jmods
+          source "$FUSION_SCRIPTS/fusion-env.sh"
+          extract_weasis weasis-native.zip input windows-x86-64
+          link_runtime jmods/*-jmods "$(fusion_modules windows)" runtime windows
+          JOPTS=(--java-options "-splash:\$APPDIR\\resources\\images\\about-round.png")
+          for opt in "${JAVA_OPTIONS[@]}"; do JOPTS+=(--java-options "$opt"); done
+          jpackage --type msi --input input --dest out --name "$APP_NAME" --app-version "$VERSION" \
+            --main-jar weasis-launcher.jar --main-class org.weasis.launcher.AppLauncher \
+            --runtime-image runtime --icon "$SCRIPT_DIR/resources/windows/Weasis.ico" \
+            --vendor "$APP_NAME" --description "DICOM viewer with SPECT/CT and PET/CT fusion" \
+            --win-per-user-install --win-dir-chooser --win-menu --win-menu-group "$APP_NAME" \
+            --win-shortcut --win-upgrade-uuid 6f3c1d6e-1b9e-4f4e-9d0c-5a1f6f2b8e41 "${JOPTS[@]}"
+          mv out/*.msi "out/WeasisFusion-$VERSION-Windows-x86_64.msi"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: package-windows-msi
+          path: out/*.msi
+
+  macos:
+    needs: build
+    runs-on: macos-latest
+    env:
+      VERSION: ${{ needs.build.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up JDK (jlink)
+        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6  # v6.0.1
+        with:
+          distribution: 'temurin'
+          java-version: ${{ env.JDK_FEATURE }}
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          name: weasis-native
+
+      - name: Build, sign ad hoc and package the apps
+        run: |
+          brew install coreutils  # readlink -f / -m of the build scripts
+          export PATH="$(brew --prefix coreutils)/libexec/gnubin:$PATH"
+          for arch in aarch64 x86-64; do
+            api=$([ "$arch" = aarch64 ] && echo aarch64 || echo x64)
+            mkdir -p "jmods-$arch"
+            curl -sSL "https://api.adoptium.net/v3/binary/latest/$JDK_FEATURE/ga/mac/$api/jmods/hotspot/normal/eclipse" | tar xz -C "jmods-$arch"
+            "$FUSION_SCRIPTS/build-macos.sh" weasis-native.zip jmods-$arch/*-jmods "$arch" "work-$arch" "work-$arch.zip"
+            app="work-$arch/WeasisFusion.app"
+            # Ad hoc: runs on Apple Silicon once the quarantine is lifted, not notarized.
+            codesign --force --deep --sign - "$app"
+            codesign --verify --deep "$app"
+            name="WeasisFusion-$VERSION-macOS-$arch"
+            mkdir -p "dmg-$arch" out
+            cp -R "$app" "dmg-$arch/"
+            ln -s /Applications "dmg-$arch/Applications"
+            hdiutil create -volname WeasisFusion -srcfolder "dmg-$arch" -ov -format UDZO "out/$name.dmg"
+            (cd "work-$arch" && ditto -c -k --keepParent WeasisFusion.app "../out/$name.zip")
+          done
+          ls -l out
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: package-macos
+          path: out/*
+
+  release:
+    needs: [build, linux, windows-setup, windows-msi, macos]
+    if: startsWith(github.ref, 'refs/tags/') || inputs.tag != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ github.ref_type == 'tag' && github.ref_name || inputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          pattern: package-*
+          path: packages
+          merge-multiple: true
+
+      - name: Publish the release
+        run: |
+          (cd packages && sha256sum * > SHA256SUMS.txt)
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            gh release upload "$TAG" packages/* --clobber
+          else
+            gh release create "$TAG" packages/* --target "$GITHUB_SHA" --title "WeasisFusion $TAG" \
+              --notes "WeasisFusion ${{ needs.build.outputs.version }}: Weasis with the SPECT/CT and PET/CT fusion layouts. Unsigned builds (macOS ad hoc)."
+          fi

@@ -48,3 +48,6 @@ weasis_*.snap
 #comlile
 build-dist
 
+
+# WeasisFusion packages built locally
+/dist-packages/
